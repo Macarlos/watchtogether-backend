@@ -40,21 +40,21 @@ PLATFORM_TO_WATCHMODE = {
     "hulu":    157,
 }
 
-# ── Mapping: our mood chips -> closest Watchmode/TMDB-style genre ids ──
-# Watchmode uses TMDB-compatible genre ids for movies, so this mapping
-# carries over. These are approximations — refine later with keywords.
+# ── Mapping: our mood chips -> Watchmode's own genre ids ──
+# Watchmode uses its OWN genre numbering, not TMDB's — confirmed via a
+# live call to /genres/. Comedy is Watchmode id 4 (TMDB id 35 is different).
 MOOD_TO_GENRES = {
-    "feelgood":  [35, 10751],   # Comedy, Family
-    "mindbend":  [9648, 878],   # Mystery, Sci-Fi
-    "comedy":    [35],
-    "thriller":  [53],
-    "romance":   [10749],
-    "nostalgic": [18],          # Drama (rough approximation)
+    "feelgood":  [4, 8],    # Comedy, Family
+    "mindbend":  [13, 15],  # Mystery, Science Fiction
+    "comedy":    [4],
+    "thriller":  [17],
+    "romance":   [14],
+    "nostalgic": [7],       # Drama (rough approximation)
 }
 
 GENRE_ID_TO_NAME = {
-    35: "Comedy", 10751: "Family", 9648: "Mystery", 878: "Sci-Fi",
-    53: "Thriller", 10749: "Romance", 18: "Drama",
+    4: "Comedy", 8: "Family", 13: "Mystery", 15: "Science Fiction",
+    17: "Thriller", 14: "Romance", 7: "Drama",
 }
 
 
@@ -86,7 +86,7 @@ def debug_discover():
     return {
         "test_1_no_filters": run(dict(base)),
         "test_2_netflix_only": run({**base, "source_ids": "203"}),
-        "test_3_genre_only": run({**base, "genres": "35"}),
+        "test_3_genre_only": run({**base, "genres": "4"}),
         "real_genre_list": run({"apiKey": WATCHMODE_API_KEY}, path="genres"),
     }
 
