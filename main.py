@@ -111,6 +111,7 @@ def discover(
     moods: str = Query("", description="Comma-separated mood ids, e.g. comedy,romance"),
     time_budget: Optional[str] = Query(None, description="90 | 120 | long"),
     region: str = Query("US", description="ISO country code — Watchmode's free plan only supports US"),
+    limit: int = Query(10, description="How many enriched results to return — keep small to conserve API credits"),
 ):
     if not WATCHMODE_API_KEY:
         raise HTTPException(status_code=500, detail="WATCHMODE_API_KEY is not configured on the server.")
@@ -121,38 +122,74 @@ def discover(
         for g in MOOD_TO_GENRES.get(m, []):
             genre_ids.add(g)
 
-    params = {
+    # ── Stage 1: cheap filtered list (1 credit) ──
+    list_params = {
         "apiKey": WATCHMODE_API_KEY,
         "types": "movie",
         "regions": region,
         "sort_by": "popularity_desc",
     }
     if source_ids:
-        params["source_ids"] = ",".join(str(s) for s in source_ids)
+        list_params["source_ids"] = ",".join(str(s) for s in source_ids)
     if genre_ids:
-        params["genres"] = ",".join(str(g) for g in genre_ids)
+        list_params["genres"] = ",".join(str(g) for g in genre_ids)
 
     try:
-        r = httpx.get(f"{WATCHMODE_BASE}/list-titles/", params=params, timeout=15)
+        r = httpx.get(f"{WATCHMODE_BASE}/list-titles/", params=list_params, timeout=15)
     except httpx.HTTPError as e:
         raise HTTPException(status_code=502, detail=f"Watchmode request failed: {e}")
-
     if r.status_code != 200:
         raise HTTPException(status_code=502, detail=f"Watchmode error {r.status_code}: {r.text}")
 
-    data = r.json()
-    titles = data.get("titles", [])[:20]
+    candidates = r.json().get("titles", [])
+    if not candidates:
+        return {"results": [], "count": 0}
+
+    # Pull a small buffer beyond `limit` so a time_budget filter still leaves enough results.
+    buffer_size = min(limit + 8, len(candidates), 25)
+    candidate_ids = [c["id"] for c in candidates[:buffer_size]]
+
+    # ── Stage 2: enrich only this small batch (1 credit per title) ──
+    def fits_time_budget(minutes):
+        if not minutes or not time_budget:
+            return True
+        if time_budget == "90":
+            return minutes <= 100
+        if time_budget == "120":
+            return 90 <= minutes <= 140
+        if time_budget == "long":
+            return minutes >= 130
+        return True
 
     results = []
-    for t in titles:
+    for title_id in candidate_ids:
+        if len(results) >= limit:
+            break
+        try:
+            dr = httpx.get(
+                f"{WATCHMODE_BASE}/title/{title_id}/details/",
+                params={"apiKey": WATCHMODE_API_KEY},
+                timeout=15,
+            )
+            if dr.status_code != 200:
+                continue
+            d = dr.json()
+        except httpx.HTTPError:
+            continue
+
+        if not fits_time_budget(d.get("runtime_minutes")):
+            continue
+
         results.append({
-            "id": t.get("id"),
-            "title": t.get("title"),
-            "year": t.get("year"),
-            "poster_url": t.get("poster") or t.get("poster_url"),
-            "genres": [GENRE_ID_TO_NAME.get(g, "") for g in (t.get("genre_ids") or []) if g in GENRE_ID_TO_NAME],
-            "rating": t.get("imdb_rating") or t.get("critic_score"),
-            "watchmode_id": t.get("id"),
+            "id": d.get("id"),
+            "title": d.get("title"),
+            "year": d.get("year"),
+            "overview": d.get("plot_overview", ""),
+            "poster_url": d.get("poster"),
+            "genres": d.get("genre_names", []),
+            "runtime_minutes": d.get("runtime_minutes"),
+            "rating": d.get("user_rating"),
+            "watchmode_id": d.get("id"),
         })
 
     return {"results": results, "count": len(results)}
