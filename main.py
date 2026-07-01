@@ -83,12 +83,22 @@ def debug_discover():
 
     base = {"apiKey": WATCHMODE_API_KEY, "types": "movie", "regions": "US"}
 
-    return {
+    result = {
         "test_1_no_filters": run(dict(base)),
         "test_2_netflix_only": run({**base, "source_ids": "203"}),
         "test_3_genre_only": run({**base, "genres": "4"}),
         "real_genre_list": run({"apiKey": WATCHMODE_API_KEY}, path="genres"),
     }
+
+    # Pull out just the first title's raw fields so we can see exactly
+    # what list-titles actually returns (vs. what we assumed it returns).
+    try:
+        first_title = result["test_1_no_filters"]["body"]["titles"][0]
+        result["sample_title_raw_fields"] = first_title
+    except Exception as e:
+        result["sample_title_raw_fields"] = f"couldn't extract: {e}"
+
+    return result
 
 
 @app.get("/api/discover")
