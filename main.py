@@ -68,7 +68,7 @@ def discover(
     platforms: str = Query("", description="Comma-separated platform ids, e.g. netflix,hbo"),
     moods: str = Query("", description="Comma-separated mood ids, e.g. comedy,romance"),
     time_budget: Optional[str] = Query(None, description="90 | 120 | long"),
-    region: str = Query("PL", description="ISO country code for availability data"),
+    region: str = Query("US", description="ISO country code — Watchmode's free plan only supports US"),
 ):
     if not WATCHMODE_API_KEY:
         raise HTTPException(status_code=500, detail="WATCHMODE_API_KEY is not configured on the server.")
@@ -92,9 +92,11 @@ def discover(
 
     try:
         r = httpx.get(f"{WATCHMODE_BASE}/list-titles/", params=params, timeout=15)
-        r.raise_for_status()
     except httpx.HTTPError as e:
         raise HTTPException(status_code=502, detail=f"Watchmode request failed: {e}")
+
+    if r.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"Watchmode error {r.status_code}: {r.text}")
 
     data = r.json()
     titles = data.get("titles", [])[:20]
@@ -115,7 +117,7 @@ def discover(
 
 
 @app.get("/api/movie/{title_id}/providers")
-def movie_providers(title_id: int, region: str = "PL"):
+def movie_providers(title_id: int, region: str = "US"):
     if not WATCHMODE_API_KEY:
         raise HTTPException(status_code=500, detail="WATCHMODE_API_KEY is not configured on the server.")
 
