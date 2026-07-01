@@ -74,9 +74,9 @@ def debug_discover():
     if not WATCHMODE_API_KEY:
         raise HTTPException(status_code=500, detail="WATCHMODE_API_KEY is not configured on the server.")
 
-    def run(params):
+    def run(params, path="list-titles"):
         try:
-            r = httpx.get(f"{WATCHMODE_BASE}/list-titles/", params=params, timeout=15)
+            r = httpx.get(f"{WATCHMODE_BASE}/{path}/", params=params, timeout=15)
             return {"status": r.status_code, "body": r.json() if r.status_code == 200 else r.text}
         except Exception as e:
             return {"status": "error", "body": str(e)}
@@ -87,6 +87,7 @@ def debug_discover():
         "test_1_no_filters": run(dict(base)),
         "test_2_netflix_only": run({**base, "source_ids": "203"}),
         "test_3_genre_only": run({**base, "genres": "35"}),
+        "real_genre_list": run({"apiKey": WATCHMODE_API_KEY}, path="genres"),
     }
 
 
