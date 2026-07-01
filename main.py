@@ -63,6 +63,33 @@ def root():
     return {"status": "ok", "service": "Reel API"}
 
 
+@app.get("/api/debug-discover")
+def debug_discover():
+    """
+    TEMPORARY diagnostic endpoint — runs three isolated Watchmode calls
+    server-side (using the already-configured key) so we can see which
+    parameter is causing empty/failed results, without ever putting the
+    API key in a browser URL. Delete this endpoint once things work.
+    """
+    if not WATCHMODE_API_KEY:
+        raise HTTPException(status_code=500, detail="WATCHMODE_API_KEY is not configured on the server.")
+
+    def run(params):
+        try:
+            r = httpx.get(f"{WATCHMODE_BASE}/list-titles/", params=params, timeout=15)
+            return {"status": r.status_code, "body": r.json() if r.status_code == 200 else r.text}
+        except Exception as e:
+            return {"status": "error", "body": str(e)}
+
+    base = {"apiKey": WATCHMODE_API_KEY, "types": "movie", "regions": "US"}
+
+    return {
+        "test_1_no_filters": run(dict(base)),
+        "test_2_netflix_only": run({**base, "source_ids": "203"}),
+        "test_3_genre_only": run({**base, "genres": "35"}),
+    }
+
+
 @app.get("/api/discover")
 def discover(
     platforms: str = Query("", description="Comma-separated platform ids, e.g. netflix,hbo"),
