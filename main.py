@@ -41,21 +41,30 @@ PLATFORM_TO_WATCHMODE = {
     "hulu":    157,
 }
 
-# ── Mapping: our mood chips -> Watchmode's own genre ids ──
-# Watchmode uses its OWN genre numbering, not TMDB's — confirmed via a
-# live call to /genres/. Comedy is Watchmode id 4 (TMDB id 35 is different).
+# ── Mapping: our mood/genre chips -> Watchmode's own genre ids ──
+# Confirmed via a live call to /genres/. Most chips now map directly to a
+# real Watchmode genre (clearer and more accurate than fuzzy "mood" guessing);
+# a few (feel-good, mind-bending, nostalgic) stay as genre combinations.
 MOOD_TO_GENRES = {
-    "feelgood":  [4, 8],    # Comedy, Family
-    "mindbend":  [13, 15],  # Mystery, Science Fiction
-    "comedy":    [4],
-    "thriller":  [17],
-    "romance":   [14],
-    "nostalgic": [7],       # Drama (rough approximation)
-}
-
-GENRE_ID_TO_NAME = {
-    4: "Comedy", 8: "Family", 13: "Mystery", 15: "Science Fiction",
-    17: "Thriller", 14: "Romance", 7: "Drama",
+    "comedy":     [4],
+    "thriller":   [17],
+    "romance":    [14],
+    "horror":     [11],
+    "action":     [1],
+    "scifi":      [15],
+    "fantasy":    [9],
+    "animated":   [3],
+    "documentary":[6],
+    "crime":      [5],
+    "history":    [10],
+    "war":        [18],
+    "western":    [19],
+    "mystery":    [13],
+    "family":     [8],
+    "musical":    [12, 32],   # Music, Musical
+    "feelgood":   [4, 8],     # Comedy, Family
+    "mindbend":   [13, 15],   # Mystery, Science Fiction
+    "nostalgic":  [7],        # Drama (rough approximation)
 }
 
 
@@ -112,7 +121,8 @@ async def discover(
     moods: str = Query("", description="Comma-separated mood ids, e.g. comedy,romance"),
     time_budget: Optional[str] = Query(None, description="90 | 120 | long"),
     region: str = Query("US", description="ISO country code — Watchmode's free plan only supports US"),
-    limit: int = Query(10, description="How many enriched results to return — keep small to conserve API credits"),
+    limit: int = Query(16, description="How many enriched results to return — keep moderate to conserve API credits"),
+    page: int = Query(1, description="Watchmode results page — used for 'load more' without repeating titles already seen"),
 ):
     if not WATCHMODE_API_KEY:
         raise HTTPException(status_code=500, detail="WATCHMODE_API_KEY is not configured on the server.")
@@ -129,6 +139,7 @@ async def discover(
         "types": "movie",
         "regions": region,
         "sort_by": "popularity_desc",
+        "page": page,
     }
     if source_ids:
         list_params["source_ids"] = ",".join(str(s) for s in source_ids)
