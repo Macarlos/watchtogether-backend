@@ -11,6 +11,7 @@ month, no card required) is built for exactly this use case.
 """
 
 import os
+import asyncio
 import httpx
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -106,7 +107,7 @@ def debug_discover():
 
 
 @app.get("/api/discover")
-def discover(
+async def discover(
     platforms: str = Query("", description="Comma-separated platform ids, e.g. netflix,hbo"),
     moods: str = Query("", description="Comma-separated mood ids, e.g. comedy,romance"),
     time_budget: Optional[str] = Query(None, description="90 | 120 | long"),
@@ -134,22 +135,35 @@ def discover(
     if genre_ids:
         list_params["genres"] = ",".join(str(g) for g in genre_ids)
 
-    try:
-        r = httpx.get(f"{WATCHMODE_BASE}/list-titles/", params=list_params, timeout=15)
-    except httpx.HTTPError as e:
-        raise HTTPException(status_code=502, detail=f"Watchmode request failed: {e}")
-    if r.status_code != 200:
-        raise HTTPException(status_code=502, detail=f"Watchmode error {r.status_code}: {r.text}")
+    async with httpx.AsyncClient(timeout=15) as client:
+        try:
+            r = await client.get(f"{WATCHMODE_BASE}/list-titles/", params=list_params)
+        except httpx.HTTPError as e:
+            raise HTTPException(status_code=502, detail=f"Watchmode request failed: {e}")
+        if r.status_code != 200:
+            raise HTTPException(status_code=502, detail=f"Watchmode error {r.status_code}: {r.text}")
 
-    candidates = r.json().get("titles", [])
-    if not candidates:
-        return {"results": [], "count": 0}
+        candidates = r.json().get("titles", [])
+        if not candidates:
+            return {"results": [], "count": 0}
 
-    # Pull a small buffer beyond `limit` so a time_budget filter still leaves enough results.
-    buffer_size = min(limit + 8, len(candidates), 25)
-    candidate_ids = [c["id"] for c in candidates[:buffer_size]]
+        # Pull a small buffer beyond `limit` so a time_budget filter still leaves enough results.
+        buffer_size = min(limit + 8, len(candidates), 25)
+        candidate_ids = [c["id"] for c in candidates[:buffer_size]]
 
-    # ── Stage 2: enrich only this small batch (1 credit per title) ──
+        # ── Stage 2: enrich the whole batch in parallel (was sequential — this is the speed fix) ──
+        async def fetch_details(title_id):
+            try:
+                dr = await client.get(
+                    f"{WATCHMODE_BASE}/title/{title_id}/details/",
+                    params={"apiKey": WATCHMODE_API_KEY},
+                )
+                return dr.json() if dr.status_code == 200 else None
+            except httpx.HTTPError:
+                return None
+
+        detail_results = await asyncio.gather(*[fetch_details(tid) for tid in candidate_ids])
+
     def fits_time_budget(minutes):
         if not minutes or not time_budget:
             return True
@@ -162,22 +176,10 @@ def discover(
         return True
 
     results = []
-    for title_id in candidate_ids:
+    for d in detail_results:
         if len(results) >= limit:
             break
-        try:
-            dr = httpx.get(
-                f"{WATCHMODE_BASE}/title/{title_id}/details/",
-                params={"apiKey": WATCHMODE_API_KEY},
-                timeout=15,
-            )
-            if dr.status_code != 200:
-                continue
-            d = dr.json()
-        except httpx.HTTPError:
-            continue
-
-        if not fits_time_budget(d.get("runtime_minutes")):
+        if not d or not fits_time_budget(d.get("runtime_minutes")):
             continue
 
         results.append({
