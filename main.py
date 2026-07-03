@@ -164,10 +164,10 @@ async def discover(
         if not candidates:
             return {"results": [], "count": 0}
 
-        # A time_budget filter discards most candidates (e.g. "all night" needs
-        # 130+ min, but most popular titles are 90-140 min) — pull a much bigger
-        # pool up front in that case, or we end up with almost nothing left.
-        if time_budget:
+        # A tight time_budget filter (90 or 120 min) discards a lot of candidates,
+        # so pull a bigger pool up front in that case. "long" no longer filters
+        # by runtime at all (see fits_time_budget below), so it doesn't need this.
+        if time_budget in ("90", "120"):
             buffer_size = min(limit * 4, len(candidates), 40)
         else:
             buffer_size = min(limit + 8, len(candidates), 25)
@@ -193,8 +193,10 @@ async def discover(
             return minutes <= 100
         if time_budget == "120":
             return 90 <= minutes <= 140
-        if time_budget == "long":
-            return minutes >= 130
+        # "long" (All night) means plenty of time available, not specifically
+        # a single very long film — so it applies no runtime constraint at all,
+        # same as no time filter. Filtering for 130+ minutes here was starving
+        # results, since most popular titles are 90-140 minutes.
         return True
 
     results = []
