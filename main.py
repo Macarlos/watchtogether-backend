@@ -109,6 +109,12 @@ def debug_discover():
         result["sample_title_details_raw"] = run(
             {"apiKey": WATCHMODE_API_KEY}, path=f"title/{sample_id}/details"
         )
+        result["sample_title_sources_raw"] = run(
+            {"apiKey": WATCHMODE_API_KEY, "regions": "US"}, path=f"title/{sample_id}/sources"
+        )
+        result["all_sources_list_raw"] = run(
+            {"apiKey": WATCHMODE_API_KEY}, path="sources"
+        )
     except Exception as e:
         result["sample_title_raw_fields"] = f"couldn't extract: {e}"
 
