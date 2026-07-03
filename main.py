@@ -98,6 +98,7 @@ def debug_discover():
         "test_2_netflix_only": run({**base, "source_ids": "203"}),
         "test_3_genre_only": run({**base, "genres": "4"}),
         "real_genre_list": run({"apiKey": WATCHMODE_API_KEY}, path="genres"),
+        "test_tv_series": run({"apiKey": WATCHMODE_API_KEY, "types": "tv_series", "regions": "US", "sort_by": "popularity_desc"}),
     }
 
     # Pull out just the first title's raw fields so we can see exactly
@@ -114,6 +115,11 @@ def debug_discover():
         )
         result["all_sources_list_raw"] = run(
             {"apiKey": WATCHMODE_API_KEY}, path="sources"
+        )
+        tv_title = result["test_tv_series"]["body"]["titles"][0]
+        result["sample_tv_raw_fields"] = tv_title
+        result["sample_tv_details_raw"] = run(
+            {"apiKey": WATCHMODE_API_KEY}, path=f"title/{tv_title['id']}/details"
         )
     except Exception as e:
         result["sample_title_raw_fields"] = f"couldn't extract: {e}"
