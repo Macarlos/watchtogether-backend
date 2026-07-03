@@ -164,8 +164,13 @@ async def discover(
         if not candidates:
             return {"results": [], "count": 0}
 
-        # Pull a small buffer beyond `limit` so a time_budget filter still leaves enough results.
-        buffer_size = min(limit + 8, len(candidates), 25)
+        # A time_budget filter discards most candidates (e.g. "all night" needs
+        # 130+ min, but most popular titles are 90-140 min) — pull a much bigger
+        # pool up front in that case, or we end up with almost nothing left.
+        if time_budget:
+            buffer_size = min(limit * 4, len(candidates), 40)
+        else:
+            buffer_size = min(limit + 8, len(candidates), 25)
         candidate_ids = [c["id"] for c in candidates[:buffer_size]]
 
         # ── Stage 2: enrich the whole batch in parallel (was sequential — this is the speed fix) ──
