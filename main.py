@@ -214,25 +214,77 @@ async def discover(
     return {"results": results, "count": len(results)}
 
 
+# ── In-memory cache of Watchmode's full source list (id -> name/logo/type). ──
+# This list is small (~280 entries) and effectively static, so we fetch it
+# once per server process rather than on every request.
+_sources_cache = None
+
+async def get_sources_lookup(client):
+    global _sources_cache
+    if _sources_cache is not None:
+        return _sources_cache
+    r = await client.get(f"{WATCHMODE_BASE}/sources/", params={"apiKey": WATCHMODE_API_KEY})
+    if r.status_code != 200:
+        return {}
+    lookup = {}
+    for s in r.json():
+        lookup[s.get("id")] = {
+            "name": s.get("name"),
+            "logo_url": s.get("logo_100px"),
+        }
+    _sources_cache = lookup
+    return lookup
+
+
 @app.get("/api/movie/{title_id}/providers")
-def movie_providers(title_id: int, region: str = "US"):
+async def movie_providers(title_id: int, region: str = "US"):
     if not WATCHMODE_API_KEY:
         raise HTTPException(status_code=500, detail="WATCHMODE_API_KEY is not configured on the server.")
 
-    try:
-        r = httpx.get(
-            f"{WATCHMODE_BASE}/title/{title_id}/sources/",
-            params={"apiKey": WATCHMODE_API_KEY, "regions": region},
-            timeout=15,
-        )
-        r.raise_for_status()
-    except httpx.HTTPError as e:
-        raise HTTPException(status_code=502, detail=f"Watchmode request failed: {e}")
+    async with httpx.AsyncClient(timeout=15) as client:
+        try:
+            r = await client.get(
+                f"{WATCHMODE_BASE}/title/{title_id}/sources/",
+                params={"apiKey": WATCHMODE_API_KEY, "regions": region},
+            )
+        except httpx.HTTPError as e:
+            raise HTTPException(status_code=502, detail=f"Watchmode request failed: {e}")
+        if r.status_code != 200:
+            raise HTTPException(status_code=502, detail=f"Watchmode error {r.status_code}: {r.text}")
 
-    sources = r.json()
-    # Only keep subscription ("sub") sources for now — rent/buy can be added later.
-    subs = [s for s in sources if s.get("type") == "sub"]
+        sources = r.json()
+        logos = await get_sources_lookup(client)
+
+    def clean(s):
+        logo = logos.get(s.get("source_id"), {}).get("logo_url")
+        return {
+            "name": s.get("name"),
+            "logo_url": logo,
+            "price": s.get("price"),
+            "format": s.get("format"),
+            "web_url": s.get("web_url"),
+        }
+
+    subscription = [clean(s) for s in sources if s.get("type") == "sub"]
+    rent = [clean(s) for s in sources if s.get("type") == "rent"]
+    buy = [clean(s) for s in sources if s.get("type") == "buy"]
+    free = [clean(s) for s in sources if s.get("type") == "free"]
+
+    # De-duplicate by name within each group (Watchmode sometimes lists the
+    # same platform twice for different formats, e.g. HD and 4K).
+    def dedupe(items):
+        seen = set()
+        out = []
+        for i in items:
+            if i["name"] in seen:
+                continue
+            seen.add(i["name"])
+            out.append(i)
+        return out
+
     return {
-        "providers": [s.get("name") for s in subs],
-        "links": [{"name": s.get("name"), "url": s.get("web_url")} for s in subs],
+        "subscription": dedupe(subscription),
+        "rent": dedupe(rent),
+        "buy": dedupe(buy),
+        "free": dedupe(free),
     }
