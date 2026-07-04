@@ -68,6 +68,29 @@ MOOD_TO_GENRES = {
 }
 
 
+def build_result_from_details(d):
+    """Maps a raw Watchmode /title/{id}/details/ response into the shape
+    the frontend expects. Shared between /api/discover (many titles) and
+    /api/title/{id} (a single title, used for shareable favorite links)."""
+    return {
+        "id": d.get("id"),
+        "title": d.get("title"),
+        "year": d.get("year"),
+        "end_year": d.get("end_year"),
+        "overview": d.get("plot_overview", ""),
+        "will_you_like_this": d.get("will_you_like_this", ""),
+        "poster_url": d.get("poster"),
+        "backdrop_url": d.get("backdrop"),
+        "genres": d.get("genre_names", []),
+        "runtime_minutes": d.get("runtime_minutes"),
+        "rating": d.get("user_rating"),
+        "critic_score": d.get("critic_score"),
+        "content_rating": d.get("us_rating"),
+        "trailer_url": d.get("trailer"),
+        "watchmode_id": d.get("id"),
+    }
+
+
 @app.get("/")
 def root():
     return {"status": "ok", "service": "Reel API"}
@@ -242,24 +265,7 @@ async def discover(
             break
         if not d or not fits_time_budget(d.get("runtime_minutes")):
             continue
-
-        results.append({
-            "id": d.get("id"),
-            "title": d.get("title"),
-            "year": d.get("year"),
-            "end_year": d.get("end_year"),
-            "overview": d.get("plot_overview", ""),
-            "will_you_like_this": d.get("will_you_like_this", ""),
-            "poster_url": d.get("poster"),
-            "backdrop_url": d.get("backdrop"),
-            "genres": d.get("genre_names", []),
-            "runtime_minutes": d.get("runtime_minutes"),
-            "rating": d.get("user_rating"),
-            "critic_score": d.get("critic_score"),
-            "content_rating": d.get("us_rating"),
-            "trailer_url": d.get("trailer"),
-            "watchmode_id": d.get("id"),
-        })
+        results.append(build_result_from_details(d))
 
     return {"results": results, "count": len(results)}
 
@@ -284,6 +290,28 @@ async def get_sources_lookup(client):
         }
     _sources_cache = lookup
     return lookup
+
+
+@app.get("/api/title/{title_id}")
+async def get_title(title_id: int):
+    """Fetches full details for one title by its Watchmode id — used when
+    someone opens a shared favorites link, to resolve each id back into a
+    real, current title (poster, description, ratings, etc.)."""
+    if not WATCHMODE_API_KEY:
+        raise HTTPException(status_code=500, detail="WATCHMODE_API_KEY is not configured on the server.")
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        try:
+            r = await client.get(
+                f"{WATCHMODE_BASE}/title/{title_id}/details/",
+                params={"apiKey": WATCHMODE_API_KEY},
+            )
+        except httpx.HTTPError as e:
+            raise HTTPException(status_code=502, detail=f"Watchmode request failed: {e}")
+        if r.status_code != 200:
+            raise HTTPException(status_code=502, detail=f"Watchmode error {r.status_code}: {r.text}")
+
+    return build_result_from_details(r.json())
 
 
 @app.get("/api/movie/{title_id}/providers")
