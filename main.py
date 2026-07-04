@@ -135,6 +135,7 @@ async def discover(
     region: str = Query("US", description="ISO country code — Watchmode's free plan only supports US"),
     limit: int = Query(16, description="How many enriched results to return — keep moderate to conserve API credits"),
     page: int = Query(1, description="Watchmode results page — used for 'load more' without repeating titles already seen"),
+    content_type: str = Query("movie", description="'movie' or 'tv_series'"),
 ):
     if not WATCHMODE_API_KEY:
         raise HTTPException(status_code=500, detail="WATCHMODE_API_KEY is not configured on the server.")
@@ -148,7 +149,7 @@ async def discover(
     # ── Stage 1: cheap filtered list (1 credit) ──
     list_params = {
         "apiKey": WATCHMODE_API_KEY,
-        "types": "movie",
+        "types": content_type if content_type in ("movie", "tv_series") else "movie",
         "regions": region,
         "sort_by": "popularity_desc",
         "page": page,
