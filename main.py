@@ -12,10 +12,10 @@ month, no card required) is built for exactly this use case.
 
 import os
 import asyncio
+import random
 import httpx
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from typing import Optional
 
 app = FastAPI(title="Reel API")
 
@@ -164,7 +164,6 @@ def debug_discover():
 async def discover(
     platforms: str = Query("", description="Comma-separated platform ids, e.g. netflix,hbo"),
     moods: str = Query("", description="Comma-separated mood ids, e.g. comedy,romance"),
-    time_budget: Optional[str] = Query(None, description="90 | 120 | long"),
     region: str = Query("US", description="ISO country code — Watchmode's free plan only supports US"),
     limit: int = Query(16, description="How many enriched results to return — keep moderate to conserve API credits"),
     page: int = Query(1, description="Watchmode results page — used for 'load more' without repeating titles already seen"),
@@ -213,16 +212,13 @@ async def discover(
         if not candidates:
             return {"results": [], "count": 0}
 
-        # A tight time_budget filter (90 or 120 min) discards a lot of candidates,
-        # so pull a bigger pool up front in that case. "long" no longer filters
-        # by runtime at all (see fits_time_budget below), so it doesn't need this.
-        # Kept moderate (not pushed higher) — too many concurrent detail-fetch
-        # requests at once was overloading Render's free-tier 0.1 CPU instance
-        # and causing the list-titles call itself to time out.
-        if time_budget in ("90", "120"):
-            buffer_size = min(limit * 3, len(candidates), 30)
-        else:
-            buffer_size = min(limit * 2, len(candidates), 24)
+        # Shuffle before slicing so two sessions with identical filters don't
+        # always show the same popularity-sorted titles in the same order —
+        # combined with the frontend starting each new session on a random
+        # page, this makes repeated sessions feel meaningfully different.
+        random.shuffle(candidates)
+
+        buffer_size = min(limit * 2, len(candidates), 24)
         candidate_ids = [c["id"] for c in candidates[:buffer_size]]
 
         # ── Stage 2: enrich in parallel, but capped in concurrency — firing all
@@ -246,24 +242,11 @@ async def discover(
 
         detail_results = await asyncio.gather(*[fetch_details(tid) for tid in candidate_ids])
 
-    def fits_time_budget(minutes):
-        if not minutes or not time_budget:
-            return True
-        if time_budget == "90":
-            return minutes <= 100
-        if time_budget == "120":
-            return 90 <= minutes <= 140
-        # "long" (All night) means plenty of time available, not specifically
-        # a single very long film — so it applies no runtime constraint at all,
-        # same as no time filter. Filtering for 130+ minutes here was starving
-        # results, since most popular titles are 90-140 minutes.
-        return True
-
     results = []
     for d in detail_results:
         if len(results) >= limit:
             break
-        if not d or not fits_time_budget(d.get("runtime_minutes")):
+        if not d:
             continue
         results.append(build_result_from_details(d))
 
