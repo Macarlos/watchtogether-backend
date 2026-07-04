@@ -314,6 +314,39 @@ async def get_title(title_id: int):
     return build_result_from_details(r.json())
 
 
+@app.get("/api/titles")
+async def get_titles(ids: str):
+    """Fetches multiple titles by id in one call, used for shared favorite
+    links. Firing many separate /api/title/{id} requests from the browser
+    at once was overloading Render's free-tier instance and causing most
+    of them to silently fail — this does the same fetching server-side
+    with capped concurrency and a retry per id, same pattern as /api/discover."""
+    if not WATCHMODE_API_KEY:
+        raise HTTPException(status_code=500, detail="WATCHMODE_API_KEY is not configured on the server.")
+
+    id_list = [s.strip() for s in ids.split(",") if s.strip()]
+    semaphore = asyncio.Semaphore(4)
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        async def fetch_one(title_id):
+            async with semaphore:
+                for attempt in range(2):
+                    try:
+                        r = await client.get(
+                            f"{WATCHMODE_BASE}/title/{title_id}/details/",
+                            params={"apiKey": WATCHMODE_API_KEY},
+                        )
+                        if r.status_code == 200:
+                            return build_result_from_details(r.json())
+                    except httpx.HTTPError:
+                        pass
+            return None
+
+        results = await asyncio.gather(*[fetch_one(tid) for tid in id_list])
+
+    return {"results": [r for r in results if r]}
+
+
 @app.get("/api/movie/{title_id}/providers")
 async def movie_providers(title_id: int, region: str = "US"):
     if not WATCHMODE_API_KEY:
