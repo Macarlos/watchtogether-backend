@@ -99,6 +99,11 @@ def debug_discover():
         "test_3_genre_only": run({**base, "genres": "4"}),
         "real_genre_list": run({"apiKey": WATCHMODE_API_KEY}, path="genres"),
         "test_tv_series": run({"apiKey": WATCHMODE_API_KEY, "types": "tv_series", "regions": "US", "sort_by": "popularity_desc"}),
+        # Comparing comma vs pipe for combining Netflix (203) + Disney+ (372).
+        # If comma means AND (must be on both), the count will be tiny.
+        # If pipe means OR (on either), the count should be much larger.
+        "test_sources_comma": run({**base, "source_ids": "203,372"}),
+        "test_sources_pipe": run({**base, "source_ids": "203|372"}),
     }
 
     # Pull out just the first title's raw fields so we can see exactly
