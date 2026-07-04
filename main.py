@@ -179,22 +179,27 @@ async def discover(
         # A tight time_budget filter (90 or 120 min) discards a lot of candidates,
         # so pull a bigger pool up front in that case. "long" no longer filters
         # by runtime at all (see fits_time_budget below), so it doesn't need this.
+        # Bumped the general case up too — narrow platform/genre combos otherwise
+        # left too little margin if a few individual detail-fetches failed.
         if time_budget in ("90", "120"):
             buffer_size = min(limit * 4, len(candidates), 40)
         else:
-            buffer_size = min(limit + 8, len(candidates), 25)
+            buffer_size = min(limit * 3, len(candidates), 40)
         candidate_ids = [c["id"] for c in candidates[:buffer_size]]
 
         # ── Stage 2: enrich the whole batch in parallel (was sequential — this is the speed fix) ──
         async def fetch_details(title_id):
-            try:
-                dr = await client.get(
-                    f"{WATCHMODE_BASE}/title/{title_id}/details/",
-                    params={"apiKey": WATCHMODE_API_KEY},
-                )
-                return dr.json() if dr.status_code == 200 else None
-            except httpx.HTTPError:
-                return None
+            for attempt in range(2):  # one retry — a handful of these were failing silently under load
+                try:
+                    dr = await client.get(
+                        f"{WATCHMODE_BASE}/title/{title_id}/details/",
+                        params={"apiKey": WATCHMODE_API_KEY},
+                    )
+                    if dr.status_code == 200:
+                        return dr.json()
+                except httpx.HTTPError:
+                    pass
+            return None
 
         detail_results = await asyncio.gather(*[fetch_details(tid) for tid in candidate_ids])
 
