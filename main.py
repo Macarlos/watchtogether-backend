@@ -165,12 +165,21 @@ async def discover(
         list_params["genres"] = ",".join(str(g) for g in genre_ids)
 
     async with httpx.AsyncClient(timeout=15) as client:
-        try:
-            r = await client.get(f"{WATCHMODE_BASE}/list-titles/", params=list_params)
-        except httpx.HTTPError as e:
-            raise HTTPException(status_code=502, detail=f"Watchmode request failed: {e}")
-        if r.status_code != 200:
-            raise HTTPException(status_code=502, detail=f"Watchmode error {r.status_code}: {r.text}")
+        r = None
+        last_error = None
+        for attempt in range(3):  # this call had zero retry before — a bare failure here killed the whole request
+            try:
+                r = await client.get(f"{WATCHMODE_BASE}/list-titles/", params=list_params)
+                if r.status_code == 200:
+                    break
+                last_error = f"Watchmode error {r.status_code}: {r.text}"
+            except httpx.HTTPError as e:
+                last_error = f"Watchmode request failed: {e}"
+            r = None
+            await asyncio.sleep(0.8)
+
+        if r is None:
+            raise HTTPException(status_code=502, detail=last_error or "Watchmode request failed after retries")
 
         candidates = r.json().get("titles", [])
         if not candidates:
@@ -179,26 +188,32 @@ async def discover(
         # A tight time_budget filter (90 or 120 min) discards a lot of candidates,
         # so pull a bigger pool up front in that case. "long" no longer filters
         # by runtime at all (see fits_time_budget below), so it doesn't need this.
-        # Bumped the general case up too — narrow platform/genre combos otherwise
-        # left too little margin if a few individual detail-fetches failed.
+        # Kept moderate (not pushed higher) — too many concurrent detail-fetch
+        # requests at once was overloading Render's free-tier 0.1 CPU instance
+        # and causing the list-titles call itself to time out.
         if time_budget in ("90", "120"):
-            buffer_size = min(limit * 4, len(candidates), 40)
+            buffer_size = min(limit * 3, len(candidates), 30)
         else:
-            buffer_size = min(limit * 3, len(candidates), 40)
+            buffer_size = min(limit * 2, len(candidates), 24)
         candidate_ids = [c["id"] for c in candidates[:buffer_size]]
 
-        # ── Stage 2: enrich the whole batch in parallel (was sequential — this is the speed fix) ──
+        # ── Stage 2: enrich in parallel, but capped in concurrency — firing all
+        # of them at once was too much load for a 0.1 CPU instance and was
+        # causing the earlier list-titles call itself to time out. ──
+        semaphore = asyncio.Semaphore(8)
+
         async def fetch_details(title_id):
-            for attempt in range(2):  # one retry — a handful of these were failing silently under load
-                try:
-                    dr = await client.get(
-                        f"{WATCHMODE_BASE}/title/{title_id}/details/",
-                        params={"apiKey": WATCHMODE_API_KEY},
-                    )
-                    if dr.status_code == 200:
-                        return dr.json()
-                except httpx.HTTPError:
-                    pass
+            async with semaphore:
+                for attempt in range(2):  # one retry — a handful of these were failing silently under load
+                    try:
+                        dr = await client.get(
+                            f"{WATCHMODE_BASE}/title/{title_id}/details/",
+                            params={"apiKey": WATCHMODE_API_KEY},
+                        )
+                        if dr.status_code == 200:
+                            return dr.json()
+                    except httpx.HTTPError:
+                        pass
             return None
 
         detail_results = await asyncio.gather(*[fetch_details(tid) for tid in candidate_ids])
