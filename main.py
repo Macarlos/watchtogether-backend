@@ -126,6 +126,11 @@ def debug_discover():
         result["sample_tv_details_raw"] = run(
             {"apiKey": WATCHMODE_API_KEY}, path=f"title/{tv_title['id']}/details"
         )
+        # Checking whether Watchmode has a cast/crew endpoint at all, and
+        # whether it includes photos, before building any UI around it.
+        result["sample_cast_crew_raw"] = run(
+            {"apiKey": WATCHMODE_API_KEY}, path=f"title/{sample_id}/cast-crew"
+        )
     except Exception as e:
         result["sample_title_raw_fields"] = f"couldn't extract: {e}"
 
@@ -242,11 +247,17 @@ async def discover(
             "id": d.get("id"),
             "title": d.get("title"),
             "year": d.get("year"),
+            "end_year": d.get("end_year"),
             "overview": d.get("plot_overview", ""),
+            "will_you_like_this": d.get("will_you_like_this", ""),
             "poster_url": d.get("poster"),
+            "backdrop_url": d.get("backdrop"),
             "genres": d.get("genre_names", []),
             "runtime_minutes": d.get("runtime_minutes"),
             "rating": d.get("user_rating"),
+            "critic_score": d.get("critic_score"),
+            "content_rating": d.get("us_rating"),
+            "trailer_url": d.get("trailer"),
             "watchmode_id": d.get("id"),
         })
 
