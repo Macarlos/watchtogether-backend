@@ -1,5 +1,5 @@
 """
-Reel — backend proxy
+Watch2Night — backend proxy
 Wraps Watchmode's search + streaming-availability data behind a simple
 endpoint the frontend can call without exposing the Watchmode API key
 in the browser.
@@ -21,7 +21,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
-app = FastAPI(title="Reel API")
+app = FastAPI(title="Watch2Night API")
 
 # ── Basic rate limiting ──
 # In-memory per-IP counter — fine for a single Render instance (no separate
@@ -149,7 +149,7 @@ def build_result_from_details(d):
 
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "Reel API"}
+    return {"status": "ok", "service": "Watch2Night API"}
 
 
 @app.post("/api/ping")

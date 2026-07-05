@@ -1,4 +1,4 @@
-# Reel API — backend
+# Watch2Night API — backend
 
 Proxies Watchmode's movie + streaming-availability data so the frontend
 never needs to hold the API key.
