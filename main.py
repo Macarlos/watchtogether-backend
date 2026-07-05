@@ -69,6 +69,21 @@ app.add_middleware(
 WATCHMODE_API_KEY = os.environ.get("WATCHMODE_API_KEY", "")
 WATCHMODE_BASE = "https://api.watchmode.com/v1"
 
+# ── Anonymous, aggregate-only usage stats ──
+# No per-user data, no IPs, no identifiers — just running totals of which
+# platforms/genres/content types get requested, purely from traffic that's
+# already happening on existing endpoints (no new frontend calls needed).
+# In-memory, so this resets on redeploy — same tradeoff as everything else
+# on Render's free tier. Viewed via /api/debug-discover's "current_stats" key.
+_stats = {
+    "total_discover_calls": 0,
+    "total_search_calls": 0,
+    "total_provider_checks": 0,
+    "platform_counts": defaultdict(int),
+    "genre_counts": defaultdict(int),
+    "content_type_counts": defaultdict(int),
+}
+
 # ── Mapping: our frontend platform ids -> Watchmode source ids ──
 # Watchmode source ids are looked up once via /sources and hardcoded here,
 # since they rarely change. Confirm these against /sources before launch.
@@ -137,13 +152,20 @@ def root():
 
 
 @app.get("/api/debug-discover")
-def debug_discover():
+def debug_discover(stats_only: bool = Query(False, description="If true, skip the live Watchmode diagnostic calls and just return usage stats")):
     """
     TEMPORARY diagnostic endpoint — runs three isolated Watchmode calls
     server-side (using the already-configured key) so we can see which
     parameter is causing empty/failed results, without ever putting the
     API key in a browser URL. Delete this endpoint once things work.
+
+    Also doubles as a viewer for anonymous aggregate usage stats (see
+    "current_stats" in the response) — pass ?stats_only=true to check
+    those without triggering the (credit-costing) diagnostic test calls.
     """
+    if stats_only:
+        return {"current_stats": _stats}
+
     if not WATCHMODE_API_KEY:
         raise HTTPException(status_code=500, detail="WATCHMODE_API_KEY is not configured on the server.")
 
@@ -202,6 +224,7 @@ def debug_discover():
     except Exception as e:
         result["sample_title_raw_fields"] = f"couldn't extract: {e}"
 
+    result["current_stats"] = _stats
     return result
 
 
@@ -216,6 +239,15 @@ async def discover(
 ):
     if not WATCHMODE_API_KEY:
         raise HTTPException(status_code=500, detail="WATCHMODE_API_KEY is not configured on the server.")
+
+    _stats["total_discover_calls"] += 1
+    _stats["content_type_counts"][content_type] += 1
+    for p in platforms.split(","):
+        if p:
+            _stats["platform_counts"][p] += 1
+    for m in moods.split(","):
+        if m:
+            _stats["genre_counts"][m] += 1
 
     source_ids = [PLATFORM_TO_WATCHMODE[p] for p in platforms.split(",") if p in PLATFORM_TO_WATCHMODE]
     genre_ids = set()
@@ -352,6 +384,8 @@ async def search_titles(query: str, content_type: str = Query("movie", descripti
     if not WATCHMODE_API_KEY:
         raise HTTPException(status_code=500, detail="WATCHMODE_API_KEY is not configured on the server.")
 
+    _stats["total_search_calls"] += 1
+
     async with httpx.AsyncClient(timeout=15) as client:
         try:
             r = await client.get(
@@ -431,6 +465,8 @@ async def get_titles(ids: str):
 async def movie_providers(title_id: int, region: str = "US"):
     if not WATCHMODE_API_KEY:
         raise HTTPException(status_code=500, detail="WATCHMODE_API_KEY is not configured on the server.")
+
+    _stats["total_provider_checks"] += 1
 
     async with httpx.AsyncClient(timeout=15) as client:
         try:
