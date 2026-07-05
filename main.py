@@ -13,11 +13,51 @@ month, no card required) is built for exactly this use case.
 import os
 import asyncio
 import random
+import time
+from collections import defaultdict
 import httpx
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 
 app = FastAPI(title="Reel API")
+
+# ── Basic rate limiting ──
+# In-memory per-IP counter — fine for a single Render instance (no separate
+# workers, no external store needed). This isn't meant to stop a determined
+# attacker, just to keep one bot or misbehaving client from silently burning
+# through the whole month's Watchmode credit allowance in an afternoon.
+RATE_LIMIT_WINDOW_SECONDS = 60
+RATE_LIMIT_MAX_REQUESTS = 30  # generous for real browsing, tight for scripted hammering
+
+_request_log = defaultdict(list)
+
+class RateLimitMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        # Render sits behind a proxy — the real client IP is in X-Forwarded-For,
+        # not request.client.host (which would just be the proxy's own IP).
+        forwarded = request.headers.get("x-forwarded-for", "")
+        client_ip = forwarded.split(",")[0].strip() if forwarded else (
+            request.client.host if request.client else "unknown"
+        )
+
+        now = time.time()
+        timestamps = _request_log[client_ip]
+        cutoff = now - RATE_LIMIT_WINDOW_SECONDS
+        while timestamps and timestamps[0] < cutoff:
+            timestamps.pop(0)
+
+        if len(timestamps) >= RATE_LIMIT_MAX_REQUESTS:
+            return JSONResponse(
+                status_code=429,
+                content={"detail": "Too many requests — please slow down and try again in a moment."},
+            )
+
+        timestamps.append(now)
+        return await call_next(request)
+
+app.add_middleware(RateLimitMiddleware)
 
 app.add_middleware(
     CORSMiddleware,
