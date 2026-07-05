@@ -302,6 +302,58 @@ async def get_title(title_id: int):
     return build_result_from_details(r.json())
 
 
+@app.get("/api/search")
+async def search_titles(query: str, content_type: str = Query("movie", description="'movie' or 'tv_series'")):
+    """Text search for a specific title, used alongside swiping for when
+    someone already knows what they want. Watchmode's /search/ endpoint
+    returns lightweight matches (plus unrelated people_results, which we
+    ignore) — we enrich the top candidates the same way /api/discover does,
+    then keep only the ones matching the requested content type."""
+    if not WATCHMODE_API_KEY:
+        raise HTTPException(status_code=500, detail="WATCHMODE_API_KEY is not configured on the server.")
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        try:
+            r = await client.get(
+                f"{WATCHMODE_BASE}/search/",
+                params={"apiKey": WATCHMODE_API_KEY, "search_field": "name", "search_value": query},
+            )
+        except httpx.HTTPError as e:
+            raise HTTPException(status_code=502, detail=f"Watchmode request failed: {e}")
+        if r.status_code != 200:
+            raise HTTPException(status_code=502, detail=f"Watchmode error {r.status_code}: {r.text}")
+
+        title_matches = [m for m in r.json().get("title_results", []) if m.get("resultType") == "title"][:15]
+        if not title_matches:
+            return {"results": [], "count": 0}
+
+        semaphore = asyncio.Semaphore(6)
+
+        async def fetch_one(title_id):
+            async with semaphore:
+                for attempt in range(2):
+                    try:
+                        dr = await client.get(
+                            f"{WATCHMODE_BASE}/title/{title_id}/details/",
+                            params={"apiKey": WATCHMODE_API_KEY},
+                        )
+                        if dr.status_code == 200:
+                            return dr.json()
+                    except httpx.HTTPError:
+                        pass
+            return None
+
+        detail_results = await asyncio.gather(*[fetch_one(m["id"]) for m in title_matches])
+
+    wanted_type = content_type if content_type in ("movie", "tv_series") else "movie"
+    results = [
+        build_result_from_details(d) for d in detail_results
+        if d and d.get("type") == wanted_type
+    ][:10]
+
+    return {"results": results, "count": len(results)}
+
+
 @app.get("/api/titles")
 async def get_titles(ids: str):
     """Fetches multiple titles by id in one call, used for shared favorite
