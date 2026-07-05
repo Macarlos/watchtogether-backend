@@ -127,6 +127,11 @@ def debug_discover():
         # If pipe means OR (on either), the count should be much larger.
         "test_sources_comma": run({**base, "source_ids": "203,372"}),
         "test_sources_pipe": run({**base, "source_ids": "203|372"}),
+        # Checking the search endpoint before building text search on top of it.
+        "test_search": run(
+            {"apiKey": WATCHMODE_API_KEY, "search_field": "name", "search_value": "dune"},
+            path="search"
+        ),
     }
 
     # Pull out just the first title's raw fields so we can see exactly
