@@ -62,7 +62,7 @@ app.add_middleware(RateLimitMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["GET"],
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
 
@@ -76,6 +76,7 @@ WATCHMODE_BASE = "https://api.watchmode.com/v1"
 # In-memory, so this resets on redeploy — same tradeoff as everything else
 # on Render's free tier. Viewed via /api/debug-discover's "current_stats" key.
 _stats = {
+    "total_page_loads": 0,  # sessions, not unique users — no identifier is ever stored
     "total_discover_calls": 0,
     "total_search_calls": 0,
     "total_provider_checks": 0,
@@ -149,6 +150,15 @@ def build_result_from_details(d):
 @app.get("/")
 def root():
     return {"status": "ok", "service": "Reel API"}
+
+
+@app.post("/api/ping")
+def ping():
+    """Anonymous session counter — increments once per page load. No cookie,
+    no identifier, nothing that could distinguish one visitor from another;
+    just a running tally of how many times the app has been opened."""
+    _stats["total_page_loads"] += 1
+    return {"ok": True}
 
 
 @app.get("/api/debug-discover")
