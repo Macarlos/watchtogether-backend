@@ -66,6 +66,36 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ── Generic in-memory TTL cache ──
+# Watchmode bills per API call, and /api/discover in particular can cost
+# 15-25+ credits for a single request (see the enrichment loop below). Two
+# visitors hitting the same filters — or the same visitor reloading, or the
+# poster wallpaper firing on every page load — would otherwise each pay that
+# cost separately. This cache lets identical requests within a short window
+# share one Watchmode round-trip instead. In-memory only (resets on redeploy,
+# not shared across instances) — the same accepted tradeoff as the existing
+# rate limiter and stats counters, fine for Render's single-instance setup.
+_ttl_cache = {}
+
+def cache_get(key):
+    entry = _ttl_cache.get(key)
+    if entry is None:
+        return None
+    expires_at, value = entry
+    if time.time() > expires_at:
+        del _ttl_cache[key]
+        return None
+    return value
+
+def cache_set(key, value, ttl_seconds):
+    _ttl_cache[key] = (time.time() + ttl_seconds, value)
+    # Simple cap so this can't grow unbounded over a long-running process —
+    # if it ever gets large, just drop the oldest quarter of entries.
+    if len(_ttl_cache) > 500:
+        oldest_keys = sorted(_ttl_cache, key=lambda k: _ttl_cache[k][0])[:125]
+        for k in oldest_keys:
+            del _ttl_cache[k]
+
 WATCHMODE_API_KEY = os.environ.get("WATCHMODE_API_KEY", "")
 WATCHMODE_BASE = "https://api.watchmode.com/v1"
 
@@ -80,6 +110,7 @@ _stats = {
     "total_discover_calls": 0,
     "total_search_calls": 0,
     "total_provider_checks": 0,
+    "cache_hits": 0,  # requests served without spending any Watchmode credits
     "platform_counts": defaultdict(int),
     "genre_counts": defaultdict(int),
     "content_type_counts": defaultdict(int),
@@ -259,6 +290,12 @@ async def discover(
         if m:
             _stats["genre_counts"][m] += 1
 
+    cache_key = ("discover", platforms, moods, region, limit, page, content_type)
+    cached = cache_get(cache_key)
+    if cached is not None:
+        _stats["cache_hits"] += 1
+        return cached
+
     source_ids = [PLATFORM_TO_WATCHMODE[p] for p in platforms.split(",") if p in PLATFORM_TO_WATCHMODE]
     genre_ids = set()
     for m in moods.split(","):
@@ -297,7 +334,9 @@ async def discover(
 
         candidates = r.json().get("titles", [])
         if not candidates:
-            return {"results": [], "count": 0}
+            empty_result = {"results": [], "count": 0}
+            cache_set(cache_key, empty_result, ttl_seconds=1200)
+            return empty_result
 
         # Shuffle before slicing so two sessions with identical filters don't
         # always show the same popularity-sorted titles in the same order —
@@ -337,7 +376,13 @@ async def discover(
             continue
         results.append(build_result_from_details(d))
 
-    return {"results": results, "count": len(results)}
+    response = {"results": results, "count": len(results)}
+    # 20 min TTL — long enough that repeated/concurrent visitors with similar
+    # filters (or the poster wallpaper, which always uses the same unfiltered
+    # request) share one Watchmode round-trip, short enough that availability
+    # data doesn't go stale for long.
+    cache_set(cache_key, response, ttl_seconds=1200)
+    return response
 
 
 # ── In-memory cache of Watchmode's full source list (id -> name/logo/type). ──
@@ -370,6 +415,12 @@ async def get_title(title_id: int):
     if not WATCHMODE_API_KEY:
         raise HTTPException(status_code=500, detail="WATCHMODE_API_KEY is not configured on the server.")
 
+    cache_key = ("title", title_id)
+    cached = cache_get(cache_key)
+    if cached is not None:
+        _stats["cache_hits"] += 1
+        return cached
+
     async with httpx.AsyncClient(timeout=15) as client:
         try:
             r = await client.get(
@@ -381,7 +432,11 @@ async def get_title(title_id: int):
         if r.status_code != 200:
             raise HTTPException(status_code=502, detail=f"Watchmode error {r.status_code}: {r.text}")
 
-    return build_result_from_details(r.json())
+    result = build_result_from_details(r.json())
+    # 6 hour TTL — title metadata (description, cast, poster) barely ever
+    # changes, so this can be cached far longer than availability/pricing.
+    cache_set(cache_key, result, ttl_seconds=21600)
+    return result
 
 
 @app.get("/api/search")
@@ -414,6 +469,11 @@ async def search_titles(query: str, content_type: str = Query("movie", descripti
         semaphore = asyncio.Semaphore(6)
 
         async def fetch_one(title_id):
+            cache_key = ("title_raw", int(title_id))
+            cached = cache_get(cache_key)
+            if cached is not None:
+                _stats["cache_hits"] += 1
+                return cached
             async with semaphore:
                 for attempt in range(2):
                     try:
@@ -422,7 +482,9 @@ async def search_titles(query: str, content_type: str = Query("movie", descripti
                             params={"apiKey": WATCHMODE_API_KEY},
                         )
                         if dr.status_code == 200:
-                            return dr.json()
+                            raw = dr.json()
+                            cache_set(cache_key, raw, ttl_seconds=21600)
+                            return raw
                     except httpx.HTTPError:
                         pass
             return None
@@ -453,6 +515,11 @@ async def get_titles(ids: str):
 
     async with httpx.AsyncClient(timeout=15) as client:
         async def fetch_one(title_id):
+            cache_key = ("title", int(title_id))
+            cached = cache_get(cache_key)
+            if cached is not None:
+                _stats["cache_hits"] += 1
+                return cached
             async with semaphore:
                 for attempt in range(2):
                     try:
@@ -461,7 +528,9 @@ async def get_titles(ids: str):
                             params={"apiKey": WATCHMODE_API_KEY},
                         )
                         if r.status_code == 200:
-                            return build_result_from_details(r.json())
+                            result = build_result_from_details(r.json())
+                            cache_set(cache_key, result, ttl_seconds=21600)
+                            return result
                     except httpx.HTTPError:
                         pass
             return None
@@ -477,6 +546,12 @@ async def movie_providers(title_id: int, region: str = "US"):
         raise HTTPException(status_code=500, detail="WATCHMODE_API_KEY is not configured on the server.")
 
     _stats["total_provider_checks"] += 1
+
+    cache_key = ("providers", title_id, region)
+    cached = cache_get(cache_key)
+    if cached is not None:
+        _stats["cache_hits"] += 1
+        return cached
 
     async with httpx.AsyncClient(timeout=15) as client:
         try:
@@ -519,9 +594,13 @@ async def movie_providers(title_id: int, region: str = "US"):
             out.append(i)
         return out
 
-    return {
+    response = {
         "subscription": dedupe(subscription),
         "rent": dedupe(rent),
         "buy": dedupe(buy),
         "free": dedupe(free),
     }
+    # 1 hour TTL — pricing/availability doesn't shift fast enough to justify
+    # spending a fresh credit on every single "final pick" view of the same title.
+    cache_set(cache_key, response, ttl_seconds=3600)
+    return response
