@@ -151,7 +151,9 @@ MOOD_TO_GENRES = {
     "musical":    [12, 32],   # Music, Musical
     "feelgood":   [4, 8],     # Comedy, Family
     "mindbend":   [13, 15],   # Mystery, Science Fiction
-    "nostalgic":  [7],        # Drama (rough approximation)
+    "drama":      [7],        # Drama — proper genre name (was mislabeled "Nostalgic")
+    "nostalgic":  [7],        # legacy alias for "drama" — kept so any cached old
+                              # frontend still gets valid results during rollout
 }
 
 
