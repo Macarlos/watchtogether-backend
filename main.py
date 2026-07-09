@@ -194,6 +194,51 @@ def ping():
     return {"ok": True}
 
 
+# ── Supported regions & country auto-detection ──
+# Watchmode's free tier allows choosing up to 3 countries; these are the
+# ones configured on the account. Anything else falls back to US.
+SUPPORTED_REGIONS = {"US", "CA", "IN"}
+DEFAULT_REGION = "US"
+
+@app.get("/api/detect-region")
+async def detect_region(request: Request):
+    """Best-effort IP -> country -> supported region lookup, purely to avoid
+    making the visitor pick a country manually. Always falls back to
+    DEFAULT_REGION on any failure — this is a nice-to-have, never something
+    that should be allowed to break the app if the geolocation service is
+    slow, down, or wrong."""
+    forwarded = request.headers.get("x-forwarded-for", "")
+    client_ip = forwarded.split(",")[0].strip() if forwarded else (
+        request.client.host if request.client else None
+    )
+
+    if not client_ip or client_ip in ("unknown", "127.0.0.1", "localhost"):
+        return {"region": DEFAULT_REGION, "detected_country": None}
+
+    cache_key = ("geo", client_ip)
+    cached = cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    try:
+        async with httpx.AsyncClient(timeout=3) as client:
+            r = await client.get(f"https://free.freeipapi.com/api/json/{client_ip}")
+        if r.status_code == 200:
+            data = r.json()
+            country_code = (data.get("countryCode") or "").upper()
+            region = country_code if country_code in SUPPORTED_REGIONS else DEFAULT_REGION
+            result = {"region": region, "detected_country": country_code or None}
+            # Cache per IP for a while — this is a decorative feature, not
+            # something that needs to be re-checked on every single request,
+            # and it keeps us comfortably under freeipapi's free rate limit.
+            cache_set(cache_key, result, ttl_seconds=3600)
+            return result
+    except Exception:
+        pass
+
+    return {"region": DEFAULT_REGION, "detected_country": None}
+
+
 @app.get("/api/debug-discover")
 def debug_discover(stats_only: bool = Query(False, description="If true, skip the live Watchmode diagnostic calls and just return usage stats")):
     """
@@ -275,13 +320,15 @@ def debug_discover(stats_only: bool = Query(False, description="If true, skip th
 async def discover(
     platforms: str = Query("", description="Comma-separated platform ids, e.g. netflix,hbo"),
     moods: str = Query("", description="Comma-separated mood ids, e.g. comedy,romance"),
-    region: str = Query("US", description="ISO country code — Watchmode's free plan only supports US"),
+    region: str = Query("US", description="ISO country code — must be one of the 3 countries configured on the Watchmode account (US, CA, IN)"),
     limit: int = Query(16, description="How many enriched results to return — keep moderate to conserve API credits"),
     page: int = Query(1, description="Watchmode results page — used for 'load more' without repeating titles already seen"),
     content_type: str = Query("movie", description="'movie' or 'tv_series'"),
 ):
     if not WATCHMODE_API_KEY:
         raise HTTPException(status_code=500, detail="WATCHMODE_API_KEY is not configured on the server.")
+
+    region = region.upper() if region.upper() in SUPPORTED_REGIONS else DEFAULT_REGION
 
     _stats["total_discover_calls"] += 1
     _stats["content_type_counts"][content_type] += 1
@@ -546,6 +593,8 @@ async def get_titles(ids: str):
 async def movie_providers(title_id: int, region: str = "US"):
     if not WATCHMODE_API_KEY:
         raise HTTPException(status_code=500, detail="WATCHMODE_API_KEY is not configured on the server.")
+
+    region = region.upper() if region.upper() in SUPPORTED_REGIONS else DEFAULT_REGION
 
     _stats["total_provider_checks"] += 1
 
