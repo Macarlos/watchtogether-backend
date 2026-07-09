@@ -116,6 +116,38 @@ _stats = {
     "content_type_counts": defaultdict(int),
 }
 
+# ── Monthly credit budget safety net ──
+# Set via Render's environment variables — defaults to the free tier's 2,500.
+# Bump this to your actual plan size (e.g. 40000) once/if upgraded. This is
+# an estimate, not a precise billing counter (resets on redeploy, doesn't
+# know Watchmode's actual billing-cycle boundary) — it exists to keep a
+# runaway day from silently exhausting the whole month's quota with zero
+# warning, not to track spend to the credit.
+MONTHLY_CREDIT_BUDGET = int(os.environ.get("MONTHLY_CREDIT_BUDGET", "2500"))
+BUDGET_SOFT_THRESHOLD = 0.85  # cut off decorative/non-essential usage (the wallpaper) first
+BUDGET_HARD_THRESHOLD = 0.97  # cut off everything, including real browsing — better a
+                              # friendly "extra busy" message than the raw 502s Watchmode
+                              # itself returns once the quota is actually gone
+
+_credits_used = 0
+
+def record_credits(n):
+    global _credits_used
+    _credits_used += n
+
+def budget_ok(hard=False):
+    threshold = BUDGET_HARD_THRESHOLD if hard else BUDGET_SOFT_THRESHOLD
+    return _credits_used < MONTHLY_CREDIT_BUDGET * threshold
+
+def budget_info():
+    return {
+        "estimated_credits_used": _credits_used,
+        "monthly_credit_budget": MONTHLY_CREDIT_BUDGET,
+        "percent_used": round(100 * _credits_used / MONTHLY_CREDIT_BUDGET, 1) if MONTHLY_CREDIT_BUDGET else 0,
+        "conservation_mode": not budget_ok(),  # decorative/wallpaper requests paused
+        "hard_paused": not budget_ok(hard=True),  # everything paused, including real browsing
+    }
+
 # ── Mapping: our frontend platform ids -> Watchmode source ids ──
 # Watchmode source ids are looked up once via /sources and hardcoded here,
 # since they rarely change. Confirm these against /sources before launch.
@@ -252,7 +284,7 @@ def debug_discover(stats_only: bool = Query(False, description="If true, skip th
     those without triggering the (credit-costing) diagnostic test calls.
     """
     if stats_only:
-        return {"current_stats": _stats}
+        return {"current_stats": _stats, "budget": budget_info()}
 
     if not WATCHMODE_API_KEY:
         raise HTTPException(status_code=500, detail="WATCHMODE_API_KEY is not configured on the server.")
@@ -313,6 +345,7 @@ def debug_discover(stats_only: bool = Query(False, description="If true, skip th
         result["sample_title_raw_fields"] = f"couldn't extract: {e}"
 
     result["current_stats"] = _stats
+    result["budget"] = budget_info()
     return result
 
 
@@ -344,6 +377,24 @@ async def discover(
     if cached is not None:
         _stats["cache_hits"] += 1
         return cached
+
+    # The poster wallpaper always calls with no platform/mood filter — that
+    # result is purely decorative, so it can be cached far longer than real
+    # browsing results without anyone noticing the difference. This alone
+    # meaningfully cuts the wallpaper's cost across many visitors sharing
+    # one cached batch instead of each paying for a fresh fetch.
+    is_unfiltered = not platforms and not moods
+    discover_ttl = 14400 if is_unfiltered else 1200  # 4 hours vs 20 minutes
+
+    # Budget safety net — once we're close to the monthly credit budget,
+    # decorative/unfiltered requests (the wallpaper) are cut off first since
+    # they're the least essential. Real filtered browsing keeps working until
+    # the budget is genuinely almost gone, then also degrades gracefully
+    # rather than grinding into Watchmode's own raw 502s.
+    if is_unfiltered and not budget_ok():
+        return {"results": [], "count": 0, "budget_paused": True}
+    if not is_unfiltered and not budget_ok(hard=True):
+        return {"results": [], "count": 0, "budget_paused": True}
 
     source_ids = [PLATFORM_TO_WATCHMODE[p] for p in platforms.split(",") if p in PLATFORM_TO_WATCHMODE]
     genre_ids = set()
@@ -381,10 +432,12 @@ async def discover(
         if r is None:
             raise HTTPException(status_code=502, detail=last_error or "Watchmode request failed after retries")
 
+        record_credits(1)  # the list-titles call itself
+
         candidates = r.json().get("titles", [])
         if not candidates:
             empty_result = {"results": [], "count": 0}
-            cache_set(cache_key, empty_result, ttl_seconds=1200)
+            cache_set(cache_key, empty_result, ttl_seconds=discover_ttl)
             return empty_result
 
         # Shuffle before slicing so two sessions with identical filters don't
@@ -393,8 +446,12 @@ async def discover(
         # page, this makes repeated sessions feel meaningfully different.
         random.shuffle(candidates)
 
-        buffer_size = min(limit * 2, len(candidates), 24)
+        # Over-fetch a bit since some candidates will fail enrichment or get
+        # filtered out — but each one costs a real Watchmode credit, so this
+        # is deliberately modest (1.4x, capped at 20) rather than generous.
+        buffer_size = min(int(limit * 1.4) + 2, len(candidates), 20)
         candidate_ids = [c["id"] for c in candidates[:buffer_size]]
+        record_credits(len(candidate_ids))  # approximate — doesn't account for retries
 
         # ── Stage 2: enrich in parallel, but capped in concurrency — firing all
         # of them at once was too much load for a 0.1 CPU instance and was
@@ -426,11 +483,10 @@ async def discover(
         results.append(build_result_from_details(d))
 
     response = {"results": results, "count": len(results)}
-    # 20 min TTL — long enough that repeated/concurrent visitors with similar
-    # filters (or the poster wallpaper, which always uses the same unfiltered
-    # request) share one Watchmode round-trip, short enough that availability
-    # data doesn't go stale for long.
-    cache_set(cache_key, response, ttl_seconds=1200)
+    # Unfiltered (wallpaper) queries get a much longer TTL — see discover_ttl
+    # above. Real filtered browsing keeps the shorter 20 min window so
+    # availability data doesn't go stale for long.
+    cache_set(cache_key, response, ttl_seconds=discover_ttl)
     return response
 
 
@@ -604,6 +660,9 @@ async def movie_providers(title_id: int, region: str = "US"):
         _stats["cache_hits"] += 1
         return cached
 
+    if not budget_ok(hard=True):
+        return {"subscription": [], "rent": [], "buy": [], "free": [], "budget_paused": True}
+
     async with httpx.AsyncClient(timeout=15) as client:
         try:
             r = await client.get(
@@ -614,6 +673,8 @@ async def movie_providers(title_id: int, region: str = "US"):
             raise HTTPException(status_code=502, detail=f"Watchmode request failed: {e}")
         if r.status_code != 200:
             raise HTTPException(status_code=502, detail=f"Watchmode error {r.status_code}: {r.text}")
+
+        record_credits(1)
 
         sources = r.json()
         logos = await get_sources_lookup(client)
