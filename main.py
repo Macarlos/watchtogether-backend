@@ -467,7 +467,14 @@ async def discover(
     cached = cache_get(result_cache_key)
     if cached is not None:
         _stats["cache_hits"] += 1
-        return cached
+        # Shuffle a copy, not the cached list itself — the cache stays a
+        # stable, reusable canonical order; each individual response gets
+        # its own fresh shuffle so repeat visits with the same filters
+        # (or the same order_by, since there are only 2 choices) don't see
+        # an identical lineup every time.
+        shuffled = cached["results"].copy()
+        random.shuffle(shuffled)
+        return {"results": shuffled, "count": len(shuffled)}
 
     # The poster wallpaper always calls with no platform/mood filter — cache
     # that combination far longer since it's purely decorative.
@@ -530,7 +537,10 @@ async def discover(
     results = [build_result_from_motn_show(s) for s in shows[:limit]]
     response = {"results": results, "count": len(results)}
     cache_set(result_cache_key, response, ttl_seconds=discover_ttl)
-    return response
+
+    shuffled = results.copy()
+    random.shuffle(shuffled)
+    return {"results": shuffled, "count": len(shuffled)}
 
 
 
