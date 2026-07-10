@@ -11,6 +11,7 @@ month, no card required) is built for exactly this use case.
 """
 
 import os
+import re
 import asyncio
 import random
 import time
@@ -192,70 +193,6 @@ def budget_info():
         "hard_paused": not budget_ok(hard=True),  # everything paused, including real browsing
     }
 
-# ── Mapping: our frontend platform ids -> Watchmode source ids ──
-# Watchmode source ids are looked up once via /sources and hardcoded here,
-# since they rarely change. Confirm these against /sources before launch.
-PLATFORM_TO_WATCHMODE = {
-    "netflix": 203,
-    "hbo":     387,   # HBO Max / Max
-    "disney":  372,
-    "prime":   26,
-    "apple":   371,
-    "hulu":    157,
-}
-
-# ── Mapping: our mood/genre chips -> Watchmode's own genre ids ──
-# Confirmed via a live call to /genres/. Most chips now map directly to a
-# real Watchmode genre (clearer and more accurate than fuzzy "mood" guessing);
-# a few (feel-good, mind-bending, nostalgic) stay as genre combinations.
-MOOD_TO_GENRES = {
-    "comedy":     [4],
-    "thriller":   [17],
-    "romance":    [14],
-    "horror":     [11],
-    "action":     [1],
-    "scifi":      [15],
-    "fantasy":    [9],
-    "animated":   [3],
-    "documentary":[6],
-    "crime":      [5],
-    "history":    [10],
-    "war":        [18],
-    "western":    [19],
-    "mystery":    [13],
-    "family":     [8],
-    "musical":    [12, 32],   # Music, Musical
-    "feelgood":   [4, 8],     # Comedy, Family
-    "mindbend":   [13, 15],   # Mystery, Science Fiction
-    "drama":      [7],        # Drama — proper genre name (was mislabeled "Nostalgic")
-    "nostalgic":  [7],        # legacy alias for "drama" — kept so any cached old
-                              # frontend still gets valid results during rollout
-}
-
-
-def build_result_from_details(d):
-    """Maps a raw Watchmode /title/{id}/details/ response into the shape
-    the frontend expects. Shared between /api/discover (many titles) and
-    /api/title/{id} (a single title, used for shareable favorite links)."""
-    return {
-        "id": d.get("id"),
-        "title": d.get("title"),
-        "year": d.get("year"),
-        "end_year": d.get("end_year"),
-        "overview": d.get("plot_overview", ""),
-        "will_you_like_this": d.get("will_you_like_this", ""),
-        "poster_url": d.get("poster"),
-        "backdrop_url": d.get("backdrop"),
-        "genres": d.get("genre_names", []),
-        "runtime_minutes": d.get("runtime_minutes"),
-        "rating": d.get("user_rating"),
-        "critic_score": d.get("critic_score"),
-        "content_rating": d.get("us_rating"),
-        "trailer_url": d.get("trailer"),
-        "watchmode_id": d.get("id"),
-    }
-
-
 def build_result_from_motn_show(show):
     """Maps a raw Movie of the Night 'show' object into the exact same shape
     build_result_from_details produces, so the frontend needs zero changes
@@ -308,8 +245,20 @@ def ping():
 # ── Supported regions & country auto-detection ──
 # Watchmode's free tier allows choosing up to 3 countries; these are the
 # ones configured on the account. Anything else falls back to US.
-SUPPORTED_REGIONS = {"US", "CA", "IN"}
+SUPPORTED_REGIONS = {"US", "CA", "IN", "GB", "AU", "MX", "ES", "BR", "FR", "DE", "PL"}
 DEFAULT_REGION = "US"
+
+# For the later UI-translation stage — which of the 7 supported languages
+# each region should show. Not used yet (stage 1 is regions/platforms only),
+# but defined alongside the region list since they're naturally paired.
+REGION_TO_LANGUAGE = {
+    "US": "en", "CA": "en", "IN": "en", "GB": "en", "AU": "en",
+    "MX": "es", "ES": "es",
+    "BR": "pt",
+    "FR": "fr",
+    "DE": "de",
+    "PL": "pl",
+}
 
 @app.get("/api/detect-region")
 async def detect_region(request: Request):
@@ -348,6 +297,56 @@ async def detect_region(request: Request):
         pass
 
     return {"region": DEFAULT_REGION, "detected_country": None}
+
+
+@app.get("/api/platforms")
+async def get_platforms(region: str = "US"):
+    """Real per-country platform list. Different countries have genuinely
+    different top streaming services — confirmed via live checks against
+    MOTN's /countries endpoint before building this (e.g. Hulu is US-only;
+    the UK has iPlayer/ITVX; Australia has Stan; Spain/Poland have
+    SkyShowtime instead of Paramount+). Netflix/Prime/Disney+/HBO/Apple TV
+    are universal across every region checked so far."""
+    region = region.upper() if region.upper() in SUPPORTED_REGIONS else DEFAULT_REGION
+
+    if not MOTN_API_KEY:
+        raise HTTPException(status_code=500, detail="MOTN_API_KEY is not configured on the server.")
+
+    cache_key = ("platforms", region)
+    cached = cache_get(cache_key)
+    if cached is not None:
+        _stats["cache_hits"] += 1
+        return cached
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        try:
+            r = await client.get(
+                f"{MOTN_BASE}/countries/{region.lower()}",
+                headers={"X-API-Key": MOTN_API_KEY},
+            )
+        except httpx.HTTPError as e:
+            raise HTTPException(status_code=502, detail=f"MOTN request failed: {e}")
+        if r.status_code != 200:
+            raise HTTPException(status_code=502, detail=f"MOTN error {r.status_code}: {r.text}")
+
+        _stats["total_motn_api_calls"] += 1
+
+    data = r.json()
+    services = data.get("services", [])[:8]  # top 8 by popularity, per MOTN's own ordering
+    platforms = []
+    for s in services:
+        images = s.get("imageSet", {})
+        platforms.append({
+            "id": s.get("id"),
+            "label": s.get("name"),
+            "logo_url": images.get("darkThemeImage") or images.get("whiteImage"),
+        })
+
+    response = {"platforms": platforms}
+    # Long TTL — a country's set of top streaming services barely ever
+    # changes, so this can be cached for a very long time.
+    cache_set(cache_key, response, ttl_seconds=86400)
+    return response
 
 
 @app.get("/api/debug-discover")
@@ -454,7 +453,11 @@ async def discover(
         if m:
             _stats["genre_counts"][m] += 1
 
-    catalogs = [p for p in platforms.split(",") if p in PLATFORM_TO_WATCHMODE]  # reusing this set just to validate known ids
+    # Platform ids now vary by region (see /api/platforms) rather than a
+    # fixed set of 6 — basic sanitization instead of a hardcoded allowlist.
+    # MOTN itself just ignores unrecognized catalog ids, so this only needs
+    # to guard against obviously malformed input, not validate real ids.
+    catalogs = [p for p in platforms.split(",") if p and re.fullmatch(r"[a-z0-9_]+", p)]
     genre_ids = []
     seen_genres = set()
     for m in moods.split(","):
