@@ -287,7 +287,7 @@ def build_result_from_motn_show(show):
         "critic_score": None,  # MOTN has one unified rating, not separate user/critic scores
         "content_rating": None,  # not seen in MOTN's schema yet — needs confirming
         "trailer_url": None,  # not seen in MOTN's schema yet — needs confirming
-        "watchmode_id": show.get("id"),  # field name kept for frontend compatibility in stage 1
+        "watchmode_id": show.get("imdbId"),  # IMDb id — field name kept for frontend compatibility; MOTN's /shows/{id} lookup accepts this directly
     }
 
 
@@ -533,35 +533,14 @@ async def discover(
     return response
 
 
-# ── In-memory cache of Watchmode's full source list (id -> name/logo/type). ──
-# This list is small (~280 entries) and effectively static, so we fetch it
-# once per server process rather than on every request.
-_sources_cache = None
-
-async def get_sources_lookup(client):
-    global _sources_cache
-    if _sources_cache is not None:
-        return _sources_cache
-    r = await client.get(f"{WATCHMODE_BASE}/sources/", params={"apiKey": WATCHMODE_API_KEY})
-    if r.status_code != 200:
-        return {}
-    lookup = {}
-    for s in r.json():
-        lookup[s.get("id")] = {
-            "name": s.get("name"),
-            "logo_url": s.get("logo_100px"),
-        }
-    _sources_cache = lookup
-    return lookup
-
 
 @app.get("/api/title/{title_id}")
-async def get_title(title_id: int):
-    """Fetches full details for one title by its Watchmode id — used when
-    someone opens a shared favorites link, to resolve each id back into a
-    real, current title (poster, description, ratings, etc.)."""
-    if not WATCHMODE_API_KEY:
-        raise HTTPException(status_code=500, detail="WATCHMODE_API_KEY is not configured on the server.")
+async def get_title(title_id: str):
+    """Fetches full details for one title by its IMDb id — used when someone
+    opens a shared favorites link, to resolve each id back into a real,
+    current title (poster, description, ratings, etc.)."""
+    if not MOTN_API_KEY:
+        raise HTTPException(status_code=500, detail="MOTN_API_KEY is not configured on the server.")
 
     cache_key = ("title", title_id)
     cached = cache_get(cache_key)
@@ -572,15 +551,17 @@ async def get_title(title_id: int):
     async with httpx.AsyncClient(timeout=15) as client:
         try:
             r = await client.get(
-                f"{WATCHMODE_BASE}/title/{title_id}/details/",
-                params={"apiKey": WATCHMODE_API_KEY},
+                f"{MOTN_BASE}/shows/{title_id}",
+                headers={"X-API-Key": MOTN_API_KEY},
             )
         except httpx.HTTPError as e:
-            raise HTTPException(status_code=502, detail=f"Watchmode request failed: {e}")
+            raise HTTPException(status_code=502, detail=f"MOTN request failed: {e}")
         if r.status_code != 200:
-            raise HTTPException(status_code=502, detail=f"Watchmode error {r.status_code}: {r.text}")
+            raise HTTPException(status_code=502, detail=f"MOTN error {r.status_code}: {r.text}")
 
-    result = build_result_from_details(r.json())
+        _stats["total_motn_api_calls"] += 1
+
+    result = build_result_from_motn_show(r.json())
     # 6 hour TTL — title metadata (description, cast, poster) barely ever
     # changes, so this can be cached far longer than availability/pricing.
     cache_set(cache_key, result, ttl_seconds=21600)
@@ -590,59 +571,38 @@ async def get_title(title_id: int):
 @app.get("/api/search")
 async def search_titles(query: str, content_type: str = Query("movie", description="'movie' or 'tv_series'")):
     """Text search for a specific title, used alongside swiping for when
-    someone already knows what they want. Watchmode's /search/ endpoint
-    returns lightweight matches (plus unrelated people_results, which we
-    ignore) — we enrich the top candidates the same way /api/discover does,
-    then keep only the ones matching the requested content type."""
-    if not WATCHMODE_API_KEY:
-        raise HTTPException(status_code=500, detail="WATCHMODE_API_KEY is not configured on the server.")
+    someone already knows what they want."""
+    if not MOTN_API_KEY:
+        raise HTTPException(status_code=500, detail="MOTN_API_KEY is not configured on the server.")
 
     _stats["total_search_calls"] += 1
+    wanted_type = "series" if content_type == "tv_series" else "movie"
 
     async with httpx.AsyncClient(timeout=15) as client:
         try:
             r = await client.get(
-                f"{WATCHMODE_BASE}/search/",
-                params={"apiKey": WATCHMODE_API_KEY, "search_field": "name", "search_value": query},
+                f"{MOTN_BASE}/shows/search/title",
+                params={"title": query, "show_type": wanted_type},
+                headers={"X-API-Key": MOTN_API_KEY},
             )
         except httpx.HTTPError as e:
-            raise HTTPException(status_code=502, detail=f"Watchmode request failed: {e}")
+            raise HTTPException(status_code=502, detail=f"MOTN request failed: {e}")
         if r.status_code != 200:
-            raise HTTPException(status_code=502, detail=f"Watchmode error {r.status_code}: {r.text}")
+            raise HTTPException(status_code=502, detail=f"MOTN error {r.status_code}: {r.text}")
 
-        title_matches = [m for m in r.json().get("title_results", []) if m.get("resultType") == "title"][:15]
-        if not title_matches:
-            return {"results": [], "count": 0}
+        _stats["total_motn_api_calls"] += 1
+        # Defensive about response shape here — confirmed the filters endpoint
+        # wraps results in {"shows": [...]}, but hadn't specifically verified
+        # title search does the same before writing this, so handling both
+        # possibilities rather than assuming.
+        parsed = r.json()
+        shows = parsed if isinstance(parsed, list) else parsed.get("shows", [])
 
-        semaphore = asyncio.Semaphore(6)
-
-        async def fetch_one(title_id):
-            cache_key = ("title_raw", int(title_id))
-            cached = cache_get(cache_key)
-            if cached is not None:
-                _stats["cache_hits"] += 1
-                return cached
-            async with semaphore:
-                for attempt in range(2):
-                    try:
-                        dr = await client.get(
-                            f"{WATCHMODE_BASE}/title/{title_id}/details/",
-                            params={"apiKey": WATCHMODE_API_KEY},
-                        )
-                        if dr.status_code == 200:
-                            raw = dr.json()
-                            cache_set(cache_key, raw, ttl_seconds=21600)
-                            return raw
-                    except httpx.HTTPError:
-                        pass
-            return None
-
-        detail_results = await asyncio.gather(*[fetch_one(m["id"]) for m in title_matches])
-
-    wanted_type = content_type if content_type in ("movie", "tv_series") else "movie"
+    # Defensive filter in case show_type isn't fully respected server-side —
+    # matches the old Watchmode implementation's same defensive habit.
     results = [
-        build_result_from_details(d) for d in detail_results
-        if d and d.get("type") == wanted_type
+        build_result_from_motn_show(s) for s in shows
+        if s.get("showType") == wanted_type
     ][:10]
 
     return {"results": results, "count": len(results)}
@@ -650,20 +610,20 @@ async def search_titles(query: str, content_type: str = Query("movie", descripti
 
 @app.get("/api/titles")
 async def get_titles(ids: str):
-    """Fetches multiple titles by id in one call, used for shared favorite
-    links. Firing many separate /api/title/{id} requests from the browser
-    at once was overloading Render's free-tier instance and causing most
-    of them to silently fail — this does the same fetching server-side
+    """Fetches multiple titles by IMDb id in one call, used for shared
+    favorite links. Firing many separate /api/title/{id} requests from the
+    browser at once was overloading Render's free-tier instance and causing
+    most of them to silently fail — this does the same fetching server-side
     with capped concurrency and a retry per id, same pattern as /api/discover."""
-    if not WATCHMODE_API_KEY:
-        raise HTTPException(status_code=500, detail="WATCHMODE_API_KEY is not configured on the server.")
+    if not MOTN_API_KEY:
+        raise HTTPException(status_code=500, detail="MOTN_API_KEY is not configured on the server.")
 
     id_list = [s.strip() for s in ids.split(",") if s.strip()]
     semaphore = asyncio.Semaphore(4)
 
     async with httpx.AsyncClient(timeout=15) as client:
         async def fetch_one(title_id):
-            cache_key = ("title", int(title_id))
+            cache_key = ("title", title_id)
             cached = cache_get(cache_key)
             if cached is not None:
                 _stats["cache_hits"] += 1
@@ -672,11 +632,12 @@ async def get_titles(ids: str):
                 for attempt in range(2):
                     try:
                         r = await client.get(
-                            f"{WATCHMODE_BASE}/title/{title_id}/details/",
-                            params={"apiKey": WATCHMODE_API_KEY},
+                            f"{MOTN_BASE}/shows/{title_id}",
+                            headers={"X-API-Key": MOTN_API_KEY},
                         )
                         if r.status_code == 200:
-                            result = build_result_from_details(r.json())
+                            _stats["total_motn_api_calls"] += 1
+                            result = build_result_from_motn_show(r.json())
                             cache_set(cache_key, result, ttl_seconds=21600)
                             return result
                     except httpx.HTTPError:
@@ -689,9 +650,13 @@ async def get_titles(ids: str):
 
 
 @app.get("/api/movie/{title_id}/providers")
-async def movie_providers(title_id: int, region: str = "US"):
-    if not WATCHMODE_API_KEY:
-        raise HTTPException(status_code=500, detail="WATCHMODE_API_KEY is not configured on the server.")
+async def movie_providers(title_id: str, region: str = "US"):
+    """title_id is now an IMDb id (e.g. 'tt0068646') — MOTN's /shows/{id}
+    endpoint accepts this directly. Kept the URL path name 'title_id' for
+    frontend compatibility; the actual identifier type changed in stage 2
+    of the Watchmode -> MOTN migration."""
+    if not MOTN_API_KEY:
+        raise HTTPException(status_code=500, detail="MOTN_API_KEY is not configured on the server.")
 
     region = region.upper() if region.upper() in SUPPORTED_REGIONS else DEFAULT_REGION
 
@@ -703,42 +668,42 @@ async def movie_providers(title_id: int, region: str = "US"):
         _stats["cache_hits"] += 1
         return cached
 
-    if not budget_ok(hard=True):
-        return {"subscription": [], "rent": [], "buy": [], "free": [], "budget_paused": True}
-
     async with httpx.AsyncClient(timeout=15) as client:
         try:
             r = await client.get(
-                f"{WATCHMODE_BASE}/title/{title_id}/sources/",
-                params={"apiKey": WATCHMODE_API_KEY, "regions": region},
+                f"{MOTN_BASE}/shows/{title_id}",
+                params={"country": region.lower()},
+                headers={"X-API-Key": MOTN_API_KEY},
             )
         except httpx.HTTPError as e:
-            raise HTTPException(status_code=502, detail=f"Watchmode request failed: {e}")
+            raise HTTPException(status_code=502, detail=f"MOTN request failed: {e}")
         if r.status_code != 200:
-            raise HTTPException(status_code=502, detail=f"Watchmode error {r.status_code}: {r.text}")
+            raise HTTPException(status_code=502, detail=f"MOTN error {r.status_code}: {r.text}")
 
-        record_credits(1)
+        _stats["total_motn_api_calls"] += 1
+        show = r.json()
 
-        sources = r.json()
-        logos = await get_sources_lookup(client)
+    options = show.get("streamingOptions", {}).get(region.lower(), [])
 
     def clean(s):
-        logo = logos.get(s.get("source_id"), {}).get("logo_url")
+        service = s.get("service", {})
+        images = service.get("imageSet", {})
+        price = s.get("price") or {}
         return {
-            "name": s.get("name"),
-            "logo_url": logo,
-            "price": s.get("price"),
-            "format": s.get("format"),
-            "web_url": s.get("web_url"),
+            "name": service.get("name"),
+            "logo_url": images.get("whiteImage") or images.get("darkThemeImage"),
+            "price": price.get("formatted"),  # a ready-to-display string like "3.99 USD" — already includes currency
+            "format": s.get("quality"),
+            "web_url": s.get("link"),  # a real deep link to the title's page on the service
         }
 
-    subscription = [clean(s) for s in sources if s.get("type") == "sub"]
-    rent = [clean(s) for s in sources if s.get("type") == "rent"]
-    buy = [clean(s) for s in sources if s.get("type") == "buy"]
-    free = [clean(s) for s in sources if s.get("type") == "free"]
+    subscription = [clean(s) for s in options if s.get("type") == "subscription"]
+    rent = [clean(s) for s in options if s.get("type") == "rent"]
+    buy = [clean(s) for s in options if s.get("type") == "buy"]
+    free = [clean(s) for s in options if s.get("type") == "free"]
 
-    # De-duplicate by name within each group (Watchmode sometimes lists the
-    # same platform twice for different formats, e.g. HD and 4K).
+    # De-duplicate by name within each group — a service can appear multiple
+    # times for different video qualities (SD/HD/4K); keep the first seen.
     def dedupe(items):
         seen = set()
         out = []
@@ -756,6 +721,7 @@ async def movie_providers(title_id: int, region: str = "US"):
         "free": dedupe(free),
     }
     # 1 hour TTL — pricing/availability doesn't shift fast enough to justify
-    # spending a fresh credit on every single "final pick" view of the same title.
+    # a fresh call on every single "final pick" view of the same title.
     cache_set(cache_key, response, ttl_seconds=3600)
     return response
+
