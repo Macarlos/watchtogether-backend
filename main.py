@@ -701,7 +701,7 @@ async def movie_providers(title_id: str, region: str = "US"):
         price = s.get("price") or {}
         return {
             "name": service.get("name"),
-            "logo_url": images.get("whiteImage") or images.get("darkThemeImage"),
+            "logo_url": images.get("darkThemeImage") or images.get("whiteImage"),
             "price": price.get("formatted"),  # a ready-to-display string like "3.99 USD" — already includes currency
             "format": s.get("quality"),
             "web_url": s.get("link"),  # a real deep link to the title's page on the service
