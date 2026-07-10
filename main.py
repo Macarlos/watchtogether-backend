@@ -99,6 +99,49 @@ def cache_set(key, value, ttl_seconds):
 WATCHMODE_API_KEY = os.environ.get("WATCHMODE_API_KEY", "")
 WATCHMODE_BASE = "https://api.watchmode.com/v1"
 
+# ── Movie of the Night ("Streaming Availability API") — replacing Watchmode ──
+# Stage 1 of the migration: this powers /api/discover only. Watchmode is left
+# untouched for search/providers/title endpoints until later stages.
+MOTN_API_KEY = os.environ.get("MOTN_API_KEY", "")
+MOTN_BASE = "https://api.movieofthenight.com/v4"
+
+# Catalog ids are identical to what Watch2Night already uses internally —
+# confirmed via a live call to /countries/us, no mapping needed at all.
+# (netflix, prime, disney, hbo, hulu, apple all match directly.)
+
+# ── Mapping: our mood/genre chips -> Movie of the Night's genre ids ──
+# Confirmed via a live call to /genres. Almost everything matches Watchmode's
+# naming directly; three differences: "animation" not "animated", "music"
+# only (no separate "musical" genre), and no analogous change for the rest.
+MOOD_TO_MOTN_GENRES = {
+    "comedy":     ["comedy"],
+    "thriller":   ["thriller"],
+    "romance":    ["romance"],
+    "horror":     ["horror"],
+    "action":     ["action"],
+    "scifi":      ["scifi"],
+    "fantasy":    ["fantasy"],
+    "animated":   ["animation"],
+    "documentary":["documentary"],
+    "crime":      ["crime"],
+    "history":    ["history"],
+    "war":        ["war"],
+    "western":    ["western"],
+    "mystery":    ["mystery"],
+    "family":     ["family"],
+    "musical":    ["music"],
+    "feelgood":   ["comedy", "family"],
+    "mindbend":   ["mystery", "scifi"],
+    "drama":      ["drama"],
+}
+
+# Confirmed-valid order_by values (seen directly in MOTN's own docs/examples).
+# Randomizing this per session replaces the old "random page 1-5" trick for
+# variety — MOTN's cursor-based pagination can't jump to a random page, but
+# a randomized sort order gives a genuinely different top-of-list each time,
+# while still allowing clean sequential cursor-walking for "load more".
+MOTN_ORDER_BY_CHOICES = ["popularity_1year", "rating"]
+
 # ── Anonymous, aggregate-only usage stats ──
 # No per-user data, no IPs, no identifiers — just running totals of which
 # platforms/genres/content types get requested, purely from traffic that's
@@ -108,6 +151,7 @@ WATCHMODE_BASE = "https://api.watchmode.com/v1"
 _stats = {
     "total_page_loads": 0,  # sessions, not unique users — no identifier is ever stored
     "total_discover_calls": 0,
+    "total_motn_api_calls": 0,  # real HTTP calls to Movie of the Night — 1 call = 1 request, no per-title enrichment cost
     "total_search_calls": 0,
     "total_provider_checks": 0,
     "cache_hits": 0,  # requests served without spending any Watchmode credits
@@ -209,6 +253,41 @@ def build_result_from_details(d):
         "content_rating": d.get("us_rating"),
         "trailer_url": d.get("trailer"),
         "watchmode_id": d.get("id"),
+    }
+
+
+def build_result_from_motn_show(show):
+    """Maps a raw Movie of the Night 'show' object into the exact same shape
+    build_result_from_details produces, so the frontend needs zero changes
+    for this stage of the migration. A few fields have no MOTN equivalent
+    (will_you_like_this, critic_score, content_rating, trailer_url) — left
+    as None/empty rather than faking data; the frontend already handles
+    these being absent gracefully (e.g. "Series" instead of a runtime).
+
+    Known gap, flagged for follow-up: content_rating and trailer_url aren't
+    present anywhere in MOTN's show schema as observed so far — worth a
+    second look at their docs later in case there's a field we've missed.
+    """
+    is_series = show.get("showType") == "series"
+    poster_set = show.get("imageSet", {}).get("verticalPoster", {})
+    backdrop_set = show.get("imageSet", {}).get("horizontalBackdrop", {})
+
+    return {
+        "id": show.get("id"),
+        "title": show.get("title"),
+        "year": show.get("firstAirYear") if is_series else show.get("releaseYear"),
+        "end_year": show.get("lastAirYear") if is_series else None,
+        "overview": show.get("overview", ""),
+        "will_you_like_this": "",  # no MOTN equivalent
+        "poster_url": poster_set.get("w480") or poster_set.get("w360"),
+        "backdrop_url": backdrop_set.get("w720") or backdrop_set.get("w480"),
+        "genres": [g.get("name") for g in show.get("genres", []) if g.get("name")],
+        "runtime_minutes": None if is_series else show.get("runtime"),
+        "rating": round(show["rating"] / 10, 1) if show.get("rating") is not None else None,
+        "critic_score": None,  # MOTN has one unified rating, not separate user/critic scores
+        "content_rating": None,  # not seen in MOTN's schema yet — needs confirming
+        "trailer_url": None,  # not seen in MOTN's schema yet — needs confirming
+        "watchmode_id": show.get("id"),  # field name kept for frontend compatibility in stage 1
     }
 
 
@@ -353,15 +432,18 @@ def debug_discover(stats_only: bool = Query(False, description="If true, skip th
 async def discover(
     platforms: str = Query("", description="Comma-separated platform ids, e.g. netflix,hbo"),
     moods: str = Query("", description="Comma-separated mood ids, e.g. comedy,romance"),
-    region: str = Query("US", description="ISO country code — must be one of the 3 countries configured on the Watchmode account (US, CA, IN)"),
-    limit: int = Query(16, description="How many enriched results to return — keep moderate to conserve API credits"),
-    page: int = Query(1, description="Watchmode results page — used for 'load more' without repeating titles already seen"),
+    region: str = Query("US", description="ISO country code — must be one of the 3 countries configured (US, CA, IN)"),
+    limit: int = Query(16, description="How many results to return (MOTN's own page size is fixed ~20; this just truncates)"),
+    page: int = Query(1, description="Our own sequential page number — MOTN uses cursor pagination under the hood, walked automatically"),
     content_type: str = Query("movie", description="'movie' or 'tv_series'"),
+    order_by: str = Query("popularity_1year", description="Sort order — the frontend randomizes this once per session for variety, since MOTN can't jump to a random page"),
 ):
-    if not WATCHMODE_API_KEY:
-        raise HTTPException(status_code=500, detail="WATCHMODE_API_KEY is not configured on the server.")
+    if not MOTN_API_KEY:
+        raise HTTPException(status_code=500, detail="MOTN_API_KEY is not configured on the server.")
 
     region = region.upper() if region.upper() in SUPPORTED_REGIONS else DEFAULT_REGION
+    order_by = order_by if order_by in MOTN_ORDER_BY_CHOICES else MOTN_ORDER_BY_CHOICES[0]
+    motn_content_type = "series" if content_type == "tv_series" else "movie"
 
     _stats["total_discover_calls"] += 1
     _stats["content_type_counts"][content_type] += 1
@@ -372,121 +454,82 @@ async def discover(
         if m:
             _stats["genre_counts"][m] += 1
 
-    cache_key = ("discover", platforms, moods, region, limit, page, content_type)
-    cached = cache_get(cache_key)
+    catalogs = [p for p in platforms.split(",") if p in PLATFORM_TO_WATCHMODE]  # reusing this set just to validate known ids
+    genre_ids = []
+    seen_genres = set()
+    for m in moods.split(","):
+        for g in MOOD_TO_MOTN_GENRES.get(m, []):
+            if g not in seen_genres:
+                seen_genres.add(g)
+                genre_ids.append(g)
+
+    result_cache_key = ("discover_result", tuple(sorted(catalogs)), tuple(genre_ids), region, motn_content_type, order_by, page, limit)
+    cached = cache_get(result_cache_key)
     if cached is not None:
         _stats["cache_hits"] += 1
         return cached
 
-    # The poster wallpaper always calls with no platform/mood filter — that
-    # result is purely decorative, so it can be cached far longer than real
-    # browsing results without anyone noticing the difference. This alone
-    # meaningfully cuts the wallpaper's cost across many visitors sharing
-    # one cached batch instead of each paying for a fresh fetch.
+    # The poster wallpaper always calls with no platform/mood filter — cache
+    # that combination far longer since it's purely decorative.
     is_unfiltered = not platforms and not moods
     discover_ttl = 14400 if is_unfiltered else 1200  # 4 hours vs 20 minutes
 
-    # Budget safety net — once we're close to the monthly credit budget,
-    # decorative/unfiltered requests (the wallpaper) are cut off first since
-    # they're the least essential. Real filtered browsing keeps working until
-    # the budget is genuinely almost gone, then also degrades gracefully
-    # rather than grinding into Watchmode's own raw 502s.
-    if is_unfiltered and not budget_ok():
-        return {"results": [], "count": 0, "budget_paused": True}
-    if not is_unfiltered and not budget_ok(hard=True):
-        return {"results": [], "count": 0, "budget_paused": True}
+    page_cache_base = ("motn_page", tuple(sorted(catalogs)), tuple(genre_ids), region, motn_content_type, order_by)
 
-    source_ids = [PLATFORM_TO_WATCHMODE[p] for p in platforms.split(",") if p in PLATFORM_TO_WATCHMODE]
-    genre_ids = set()
-    for m in moods.split(","):
-        for g in MOOD_TO_GENRES.get(m, []):
-            genre_ids.add(g)
+    async def fetch_motn_page(cursor):
+        params = {"country": region.lower(), "show_type": motn_content_type}
+        if catalogs:
+            params["catalogs"] = ",".join(catalogs)
+        if genre_ids:
+            params["genres"] = ",".join(genre_ids)
+            params["genres_relation"] = "or"
+        if order_by:
+            params["order_by"] = order_by
+        if cursor:
+            params["cursor"] = cursor
 
-    # ── Stage 1: cheap filtered list (1 credit) ──
-    list_params = {
-        "apiKey": WATCHMODE_API_KEY,
-        "types": content_type if content_type in ("movie", "tv_series") else "movie",
-        "regions": region,
-        "sort_by": "popularity_desc",
-        "page": page,
-    }
-    if source_ids:
-        list_params["source_ids"] = ",".join(str(s) for s in source_ids)
-    if genre_ids:
-        list_params["genres"] = ",".join(str(g) for g in genre_ids)
-
-    async with httpx.AsyncClient(timeout=15) as client:
-        r = None
         last_error = None
-        for attempt in range(3):  # this call had zero retry before — a bare failure here killed the whole request
-            try:
-                r = await client.get(f"{WATCHMODE_BASE}/list-titles/", params=list_params)
-                if r.status_code == 200:
-                    break
-                last_error = f"Watchmode error {r.status_code}: {r.text}"
-            except httpx.HTTPError as e:
-                last_error = f"Watchmode request failed: {e}"
-            r = None
-            await asyncio.sleep(0.8)
+        async with httpx.AsyncClient(timeout=15) as client:
+            for attempt in range(3):
+                try:
+                    r = await client.get(
+                        f"{MOTN_BASE}/shows/search/filters",
+                        params=params,
+                        headers={"X-API-Key": MOTN_API_KEY},
+                    )
+                    if r.status_code == 200:
+                        _stats["total_motn_api_calls"] += 1
+                        return r.json()
+                    last_error = f"MOTN error {r.status_code}: {r.text}"
+                except httpx.HTTPError as e:
+                    last_error = f"MOTN request failed: {e}"
+                await asyncio.sleep(0.8)
+        raise HTTPException(status_code=502, detail=last_error or "MOTN request failed after retries")
 
-        if r is None:
-            raise HTTPException(status_code=502, detail=last_error or "Watchmode request failed after retries")
+    # Walk the cursor chain sequentially up to the requested page. In normal
+    # use the frontend always requests pages in order (1, then 2, then 3...),
+    # so every page except the very first is almost always already cached
+    # from a previous request — this loop only does real work on a cache miss.
+    page_num = 1
+    cursor = None
+    page_data = None
+    while page_num <= page:
+        this_page_key = page_cache_base + (page_num,)
+        cached_page = cache_get(this_page_key)
+        if cached_page is not None:
+            page_data = cached_page
+        else:
+            page_data = await fetch_motn_page(cursor)
+            cache_set(this_page_key, page_data, ttl_seconds=discover_ttl)
+        cursor = page_data.get("nextCursor")
+        if page_num < page and not page_data.get("hasMore"):
+            break  # ran out of pages before reaching the requested one
+        page_num += 1
 
-        record_credits(1)  # the list-titles call itself
-
-        candidates = r.json().get("titles", [])
-        if not candidates:
-            empty_result = {"results": [], "count": 0}
-            cache_set(cache_key, empty_result, ttl_seconds=discover_ttl)
-            return empty_result
-
-        # Shuffle before slicing so two sessions with identical filters don't
-        # always show the same popularity-sorted titles in the same order —
-        # combined with the frontend starting each new session on a random
-        # page, this makes repeated sessions feel meaningfully different.
-        random.shuffle(candidates)
-
-        # Over-fetch a bit since some candidates will fail enrichment or get
-        # filtered out — but each one costs a real Watchmode credit, so this
-        # is deliberately modest (1.4x, capped at 20) rather than generous.
-        buffer_size = min(int(limit * 1.4) + 2, len(candidates), 20)
-        candidate_ids = [c["id"] for c in candidates[:buffer_size]]
-        record_credits(len(candidate_ids))  # approximate — doesn't account for retries
-
-        # ── Stage 2: enrich in parallel, but capped in concurrency — firing all
-        # of them at once was too much load for a 0.1 CPU instance and was
-        # causing the earlier list-titles call itself to time out. ──
-        semaphore = asyncio.Semaphore(8)
-
-        async def fetch_details(title_id):
-            async with semaphore:
-                for attempt in range(2):  # one retry — a handful of these were failing silently under load
-                    try:
-                        dr = await client.get(
-                            f"{WATCHMODE_BASE}/title/{title_id}/details/",
-                            params={"apiKey": WATCHMODE_API_KEY},
-                        )
-                        if dr.status_code == 200:
-                            return dr.json()
-                    except httpx.HTTPError:
-                        pass
-            return None
-
-        detail_results = await asyncio.gather(*[fetch_details(tid) for tid in candidate_ids])
-
-    results = []
-    for d in detail_results:
-        if len(results) >= limit:
-            break
-        if not d:
-            continue
-        results.append(build_result_from_details(d))
-
+    shows = (page_data or {}).get("shows", [])
+    results = [build_result_from_motn_show(s) for s in shows[:limit]]
     response = {"results": results, "count": len(results)}
-    # Unfiltered (wallpaper) queries get a much longer TTL — see discover_ttl
-    # above. Real filtered browsing keeps the shorter 20 min window so
-    # availability data doesn't go stale for long.
-    cache_set(cache_key, response, ttl_seconds=discover_ttl)
+    cache_set(result_cache_key, response, ttl_seconds=discover_ttl)
     return response
 
 
