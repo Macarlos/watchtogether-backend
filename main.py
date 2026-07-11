@@ -542,7 +542,7 @@ async def discover(
                 seen_genres.add(g)
                 genre_ids.append(g)
 
-    result_cache_key = ("discover_result", tuple(sorted(catalogs)), tuple(genre_ids), region, motn_content_type, order_by, page, limit, motn_language)
+    result_cache_key = ("discover_result", tuple(sorted(catalogs)), tuple(genre_ids), region, motn_content_type, order_by, page, limit, motn_language, language)
     cached = cache_get(result_cache_key)
     if cached is not None:
         _stats["cache_hits"] += 1
@@ -616,6 +616,17 @@ async def discover(
 
     shows = (page_data or {}).get("shows", [])
     results = [build_result_from_motn_show(s) for s in shows[:limit]]
+
+    if language in GROQ_TRANSLATE_LANGUAGES:
+        groq_semaphore = asyncio.Semaphore(4)
+
+        async def translate_one(result):
+            if result.get("overview"):
+                async with groq_semaphore:
+                    result["overview"] = await translate_overview_via_groq(result["overview"], language)
+
+        await asyncio.gather(*[translate_one(r) for r in results])
+
     response = {"results": results, "count": len(results)}
     cache_set(result_cache_key, response, ttl_seconds=discover_ttl)
 
