@@ -558,7 +558,7 @@ async def discover(
     # The poster wallpaper always calls with no platform/mood filter — cache
     # that combination far longer since it's purely decorative.
     is_unfiltered = not platforms and not moods
-    discover_ttl = 14400 if is_unfiltered else 1200  # 4 hours vs 20 minutes
+    discover_ttl = 604800 if is_unfiltered else 1200  # 7 days vs 20 minutes
 
     page_cache_base = ("motn_page", tuple(sorted(catalogs)), tuple(genre_ids), region, motn_content_type, order_by, motn_language)
 
@@ -850,4 +850,3 @@ async def movie_providers(title_id: str, region: str = "US"):
     # a fresh call on every single "final pick" view of the same title.
     cache_set(cache_key, response, ttl_seconds=3600)
     return response
-
