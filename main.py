@@ -106,6 +106,67 @@ WATCHMODE_BASE = "https://api.watchmode.com/v1"
 MOTN_API_KEY = os.environ.get("MOTN_API_KEY", "")
 MOTN_BASE = "https://api.movieofthenight.com/v4"
 
+# ── Language support, split by who actually handles the translation ──
+# MOTN's own output_language parameter covers en/es/fr/de directly — real
+# official regional titles and data from their own database, not machine-
+# translated guesses. Confirmed via their docs: MOTN does NOT support pt/hi/pl
+# at all (no amount of parameter-passing changes that), so for those three we
+# fall back to Groq for just the overview text — titles/genres stay in
+# English there, since machine-translating official release titles risks
+# confidently wrong results.
+MOTN_NATIVE_LANGUAGES = {"en", "es", "fr", "de"}
+GROQ_TRANSLATE_LANGUAGES = {"pt", "hi", "pl"}
+LANGUAGE_NAMES = {"pt": "Portuguese", "hi": "Hindi", "pl": "Polish"}
+
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+GROQ_BASE = "https://api.groq.com/openai/v1"
+# gpt-oss-20b — Groq's recommended fast/cheap model as of their June 2026
+# deprecation of llama-3.1-8b-instant. Plenty capable for a short synopsis.
+GROQ_MODEL = "openai/gpt-oss-20b"
+
+async def translate_overview_via_groq(text, target_lang):
+    """Translates a movie/show overview into a language MOTN doesn't support
+    natively. Deliberately narrow in scope — only called when someone views
+    a title's full details (not per swipe-deck card), since Groq's free tier
+    caps at 30 requests/minute and this needs to never be the bottleneck.
+    Falls back to the original English text on any failure — a missing
+    translation is far better than a broken detail page."""
+    if not GROQ_API_KEY or not text:
+        return text
+
+    cache_key = ("groq_overview", hash(text), target_lang)
+    cached = cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    language_name = LANGUAGE_NAMES.get(target_lang, target_lang)
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.post(
+                f"{GROQ_BASE}/chat/completions",
+                headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+                json={
+                    "model": GROQ_MODEL,
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": f"You translate movie and TV show synopses into {language_name}. Reply with ONLY the translated text — no quotes, no commentary, no explanation.",
+                        },
+                        {"role": "user", "content": text},
+                    ],
+                    "temperature": 0.3,
+                },
+            )
+            if r.status_code == 200:
+                translated = r.json()["choices"][0]["message"]["content"].strip()
+                if translated:
+                    # Long TTL — a synopsis translation never changes once done.
+                    cache_set(cache_key, translated, ttl_seconds=2592000)  # 30 days
+                    return translated
+    except Exception:
+        pass
+    return text
+
 # Catalog ids are identical to what Watch2Night already uses internally —
 # confirmed via a live call to /countries/us, no mapping needed at all.
 # (netflix, prime, disney, hbo, hulu, apple all match directly.)
@@ -436,9 +497,12 @@ async def discover(
     page: int = Query(1, description="Our own sequential page number — MOTN uses cursor pagination under the hood, walked automatically"),
     content_type: str = Query("movie", description="'movie' or 'tv_series'"),
     order_by: str = Query("popularity_1year", description="Sort order — the frontend randomizes this once per session for variety, since MOTN can't jump to a random page"),
+    language: str = Query("en", description="UI language — only en/es/fr/de get passed to MOTN as output_language; pt/hi/pl aren't supported by MOTN so this stays English for the swipe deck (overview translation happens only on the detail view)"),
 ):
     if not MOTN_API_KEY:
         raise HTTPException(status_code=500, detail="MOTN_API_KEY is not configured on the server.")
+
+    motn_language = language if language in MOTN_NATIVE_LANGUAGES else "en"
 
     region = region.upper() if region.upper() in SUPPORTED_REGIONS else DEFAULT_REGION
     order_by = order_by if order_by in MOTN_ORDER_BY_CHOICES else MOTN_ORDER_BY_CHOICES[0]
@@ -466,7 +530,7 @@ async def discover(
                 seen_genres.add(g)
                 genre_ids.append(g)
 
-    result_cache_key = ("discover_result", tuple(sorted(catalogs)), tuple(genre_ids), region, motn_content_type, order_by, page, limit)
+    result_cache_key = ("discover_result", tuple(sorted(catalogs)), tuple(genre_ids), region, motn_content_type, order_by, page, limit, motn_language)
     cached = cache_get(result_cache_key)
     if cached is not None:
         _stats["cache_hits"] += 1
@@ -484,7 +548,7 @@ async def discover(
     is_unfiltered = not platforms and not moods
     discover_ttl = 14400 if is_unfiltered else 1200  # 4 hours vs 20 minutes
 
-    page_cache_base = ("motn_page", tuple(sorted(catalogs)), tuple(genre_ids), region, motn_content_type, order_by)
+    page_cache_base = ("motn_page", tuple(sorted(catalogs)), tuple(genre_ids), region, motn_content_type, order_by, motn_language)
 
     async def fetch_motn_page(cursor):
         params = {"country": region.lower(), "show_type": motn_content_type}
@@ -495,6 +559,8 @@ async def discover(
             params["genres_relation"] = "or"
         if order_by:
             params["order_by"] = order_by
+        if motn_language != "en":
+            params["output_language"] = motn_language
         if cursor:
             params["cursor"] = cursor
 
@@ -548,14 +614,19 @@ async def discover(
 
 
 @app.get("/api/title/{title_id}")
-async def get_title(title_id: str):
+async def get_title(title_id: str, language: str = Query("en", description="UI language")):
     """Fetches full details for one title by its IMDb id — used when someone
     opens a shared favorites link, to resolve each id back into a real,
-    current title (poster, description, ratings, etc.)."""
+    current title (poster, description, ratings, etc.). Also the endpoint
+    the frontend re-fetches from when viewing a title's full details in a
+    language MOTN doesn't natively support, to get a Groq-translated overview."""
     if not MOTN_API_KEY:
         raise HTTPException(status_code=500, detail="MOTN_API_KEY is not configured on the server.")
 
-    cache_key = ("title", title_id)
+    motn_language = language if language in MOTN_NATIVE_LANGUAGES else "en"
+    needs_groq = language in GROQ_TRANSLATE_LANGUAGES
+
+    cache_key = ("title", title_id, motn_language, language if needs_groq else None)
     cached = cache_get(cache_key)
     if cached is not None:
         _stats["cache_hits"] += 1
@@ -563,8 +634,12 @@ async def get_title(title_id: str):
 
     async with httpx.AsyncClient(timeout=15) as client:
         try:
+            title_params = {}
+            if motn_language != "en":
+                title_params["output_language"] = motn_language
             r = await client.get(
                 f"{MOTN_BASE}/shows/{title_id}",
+                params=title_params,
                 headers={"X-API-Key": MOTN_API_KEY},
             )
         except httpx.HTTPError as e:
@@ -575,6 +650,10 @@ async def get_title(title_id: str):
         _stats["total_motn_api_calls"] += 1
 
     result = build_result_from_motn_show(r.json())
+
+    if needs_groq and result.get("overview"):
+        result["overview"] = await translate_overview_via_groq(result["overview"], language)
+
     # 6 hour TTL — title metadata (description, cast, poster) barely ever
     # changes, so this can be cached far longer than availability/pricing.
     cache_set(cache_key, result, ttl_seconds=21600)
@@ -582,7 +661,11 @@ async def get_title(title_id: str):
 
 
 @app.get("/api/search")
-async def search_titles(query: str, content_type: str = Query("movie", description="'movie' or 'tv_series'")):
+async def search_titles(
+    query: str,
+    content_type: str = Query("movie", description="'movie' or 'tv_series'"),
+    language: str = Query("en", description="UI language — only en/es/fr/de get passed to MOTN"),
+):
     """Text search for a specific title, used alongside swiping for when
     someone already knows what they want."""
     if not MOTN_API_KEY:
@@ -590,12 +673,16 @@ async def search_titles(query: str, content_type: str = Query("movie", descripti
 
     _stats["total_search_calls"] += 1
     wanted_type = "series" if content_type == "tv_series" else "movie"
+    motn_language = language if language in MOTN_NATIVE_LANGUAGES else "en"
 
     async with httpx.AsyncClient(timeout=15) as client:
         try:
+            search_params = {"title": query, "show_type": wanted_type}
+            if motn_language != "en":
+                search_params["output_language"] = motn_language
             r = await client.get(
                 f"{MOTN_BASE}/shows/search/title",
-                params={"title": query, "show_type": wanted_type},
+                params=search_params,
                 headers={"X-API-Key": MOTN_API_KEY},
             )
         except httpx.HTTPError as e:
@@ -622,7 +709,7 @@ async def search_titles(query: str, content_type: str = Query("movie", descripti
 
 
 @app.get("/api/titles")
-async def get_titles(ids: str):
+async def get_titles(ids: str, language: str = Query("en", description="UI language — only en/es/fr/de get passed to MOTN. No Groq translation here (a shared list can contain many titles at once, which could burst past Groq's rate limit) — that only happens on individual detail views.")):
     """Fetches multiple titles by IMDb id in one call, used for shared
     favorite links. Firing many separate /api/title/{id} requests from the
     browser at once was overloading Render's free-tier instance and causing
@@ -631,12 +718,13 @@ async def get_titles(ids: str):
     if not MOTN_API_KEY:
         raise HTTPException(status_code=500, detail="MOTN_API_KEY is not configured on the server.")
 
+    motn_language = language if language in MOTN_NATIVE_LANGUAGES else "en"
     id_list = [s.strip() for s in ids.split(",") if s.strip()]
     semaphore = asyncio.Semaphore(4)
 
     async with httpx.AsyncClient(timeout=15) as client:
         async def fetch_one(title_id):
-            cache_key = ("title", title_id)
+            cache_key = ("title", title_id, motn_language, None)
             cached = cache_get(cache_key)
             if cached is not None:
                 _stats["cache_hits"] += 1
@@ -644,8 +732,10 @@ async def get_titles(ids: str):
             async with semaphore:
                 for attempt in range(2):
                     try:
+                        title_params = {"output_language": motn_language} if motn_language != "en" else {}
                         r = await client.get(
                             f"{MOTN_BASE}/shows/{title_id}",
+                            params=title_params,
                             headers={"X-API-Key": MOTN_API_KEY},
                         )
                         if r.status_code == 200:
