@@ -15,6 +15,7 @@ import re
 import asyncio
 import random
 import time
+from urllib.parse import quote_plus
 from collections import defaultdict
 import httpx
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -257,23 +258,34 @@ def budget_info():
 def build_result_from_motn_show(show):
     """Maps a raw Movie of the Night 'show' object into the exact same shape
     build_result_from_details produces, so the frontend needs zero changes
-    for this stage of the migration. A few fields have no MOTN equivalent
-    (will_you_like_this, critic_score, content_rating, trailer_url) — left
-    as None/empty rather than faking data; the frontend already handles
-    these being absent gracefully (e.g. "Series" instead of a runtime).
+    for this stage of the migration. A couple of fields have no MOTN
+    equivalent (will_you_like_this, critic_score, content_rating) — left as
+    None/empty rather than faking data; the frontend already handles these
+    being absent gracefully (e.g. "Series" instead of a runtime).
 
-    Known gap, flagged for follow-up: content_rating and trailer_url aren't
-    present anywhere in MOTN's show schema as observed so far — worth a
-    second look at their docs later in case there's a field we've missed.
+    Confirmed via MOTN's own Show object reference (the full field list is
+    explicitly documented): content_rating genuinely isn't part of their
+    schema — not a gap in our integration, it's just not data they provide.
     """
     is_series = show.get("showType") == "series"
     poster_set = show.get("imageSet", {}).get("verticalPoster", {})
     backdrop_set = show.get("imageSet", {}).get("horizontalBackdrop", {})
+    title = show.get("title")
+    year = show.get("firstAirYear") if is_series else show.get("releaseYear")
+
+    # MOTN's schema confirmed has no trailer field at all (unlike Watchmode).
+    # Rather than show nothing, link to a YouTube search for it — same
+    # "point them at a search rather than nothing" pattern already used for
+    # the JustWatch fallback link when streaming info is missing.
+    trailer_url = None
+    if title:
+        query = f"{title} {year} official trailer" if year else f"{title} official trailer"
+        trailer_url = f"https://www.youtube.com/results?search_query={quote_plus(query)}"
 
     return {
         "id": show.get("id"),
-        "title": show.get("title"),
-        "year": show.get("firstAirYear") if is_series else show.get("releaseYear"),
+        "title": title,
+        "year": year,
         "end_year": show.get("lastAirYear") if is_series else None,
         "overview": show.get("overview", ""),
         "will_you_like_this": "",  # no MOTN equivalent
@@ -283,8 +295,8 @@ def build_result_from_motn_show(show):
         "runtime_minutes": None if is_series else show.get("runtime"),
         "rating": round(show["rating"] / 10, 1) if show.get("rating") is not None else None,
         "critic_score": None,  # MOTN has one unified rating, not separate user/critic scores
-        "content_rating": None,  # not seen in MOTN's schema yet — needs confirming
-        "trailer_url": None,  # not seen in MOTN's schema yet — needs confirming
+        "content_rating": None,  # confirmed absent from MOTN's schema
+        "trailer_url": trailer_url,
         "watchmode_id": show.get("imdbId"),  # IMDb id — field name kept for frontend compatibility; MOTN's /shows/{id} lookup accepts this directly
     }
 
