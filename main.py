@@ -688,6 +688,7 @@ async def search_titles(
     query: str,
     content_type: str = Query("movie", description="'movie' or 'tv_series'"),
     language: str = Query("en", description="UI language — only en/es/fr/de get passed to MOTN"),
+    region: str = Query("US", description="ISO country code — required by MOTN's search endpoint"),
 ):
     """Text search for a specific title, used alongside swiping for when
     someone already knows what they want."""
@@ -697,10 +698,11 @@ async def search_titles(
     _stats["total_search_calls"] += 1
     wanted_type = "series" if content_type == "tv_series" else "movie"
     motn_language = language if language in MOTN_NATIVE_LANGUAGES else "en"
+    region = region.upper() if region.upper() in SUPPORTED_REGIONS else DEFAULT_REGION
 
     async with httpx.AsyncClient(timeout=15) as client:
         try:
-            search_params = {"title": query, "show_type": wanted_type}
+            search_params = {"title": query, "show_type": wanted_type, "country": region.lower()}
             if motn_language != "en":
                 search_params["output_language"] = motn_language
             r = await client.get(
@@ -850,3 +852,4 @@ async def movie_providers(title_id: str, region: str = "US"):
     # a fresh call on every single "final pick" view of the same title.
     cache_set(cache_key, response, ttl_seconds=3600)
     return response
+
