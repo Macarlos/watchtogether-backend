@@ -639,6 +639,125 @@ async def discover(
 
 
 
+@app.get("/api/recently-added")
+async def recently_added(
+    platforms: str = Query("", description="Comma-separated platform ids, e.g. netflix,hbo"),
+    region: str = Query("US", description="ISO country code — must be one of the 3 countries configured (US, CA, IN)"),
+    limit: int = Query(16, description="How many results to return"),
+    page: int = Query(1, description="Our own sequential page number — MOTN's Changes endpoint uses cursor pagination under the hood, walked automatically, same as /api/discover"),
+    content_type: str = Query("movie", description="'movie' or 'tv_series'"),
+    language: str = Query("en", description="UI language"),
+):
+    """Uses MOTN's /changes endpoint (change_type=new) instead of the regular
+    search-by-filters — this reflects when a title actually landed on a
+    platform's catalog, not its release date, which is what "Recently Added"
+    means to a user (an old movie that just showed up on Hulu still counts).
+    Reuses build_result_from_motn_show so the frontend needs zero changes to
+    render these results — same shape as /api/discover.
+    """
+    if not MOTN_API_KEY:
+        raise HTTPException(status_code=500, detail="MOTN_API_KEY is not configured on the server.")
+
+    motn_language = language if language in MOTN_NATIVE_LANGUAGES else "en"
+    region = region.upper() if region.upper() in SUPPORTED_REGIONS else DEFAULT_REGION
+    motn_content_type = "series" if content_type == "tv_series" else "movie"
+
+    catalogs = [p for p in platforms.split(",") if p and re.fullmatch(r"[a-z0-9_]+", p)]
+
+    result_cache_key = ("recently_added_result", tuple(sorted(catalogs)), region, motn_content_type, page, limit, motn_language, language)
+    cached = cache_get(result_cache_key)
+    if cached is not None:
+        _stats["cache_hits"] += 1
+        return cached
+
+    # Changes reflect real calendar time (something new could land on a
+    # platform any hour), so this refreshes far more often than the regular
+    # discover cache — 1 hour, not 20 minutes-to-7-days.
+    recently_added_ttl = 3600
+
+    page_cache_base = ("motn_changes_page", tuple(sorted(catalogs)), region, motn_content_type, motn_language)
+
+    async def fetch_motn_page(cursor):
+        params = {
+            "country": region.lower(),
+            "change_type": "new",
+            "item_type": "show",
+            "show_type": motn_content_type,
+        }
+        if catalogs:
+            params["catalogs"] = ",".join(catalogs)
+        if motn_language != "en":
+            params["output_language"] = motn_language
+        if cursor:
+            params["cursor"] = cursor
+
+        last_error = None
+        async with httpx.AsyncClient(timeout=15) as client:
+            for attempt in range(3):
+                try:
+                    r = await client.get(
+                        f"{MOTN_BASE}/changes",
+                        params=params,
+                        headers={"X-API-Key": MOTN_API_KEY},
+                    )
+                    if r.status_code == 200:
+                        _stats["total_motn_api_calls"] += 1
+                        return r.json()
+                    last_error = f"MOTN error {r.status_code}: {r.text}"
+                except httpx.HTTPError as e:
+                    last_error = f"MOTN request failed: {e}"
+                await asyncio.sleep(0.8)
+        raise HTTPException(status_code=502, detail=last_error or "MOTN request failed after retries")
+
+    page_num = 1
+    cursor = None
+    page_data = None
+    while page_num <= page:
+        this_page_key = page_cache_base + (page_num,)
+        cached_page = cache_get(this_page_key)
+        if cached_page is not None:
+            page_data = cached_page
+        else:
+            page_data = await fetch_motn_page(cursor)
+            cache_set(this_page_key, page_data, ttl_seconds=recently_added_ttl)
+        cursor = page_data.get("nextCursor")
+        if page_num < page and not page_data.get("hasMore"):
+            break  # ran out of pages before reaching the requested one
+        page_num += 1
+
+    changes = (page_data or {}).get("changes", [])
+    shows_by_id = (page_data or {}).get("shows", {})
+
+    # A show can have more than one change entry on the same page (e.g. it
+    # was added on two services the same day) — dedupe while preserving the
+    # changes list's own order, which is most-recent-first. That ordering is
+    # the entire point of this feature, so unlike /api/discover this
+    # response is NOT shuffled before being returned or cached.
+    seen_ids = set()
+    ordered_shows = []
+    for change in changes:
+        show_id = change.get("showId")
+        if show_id and show_id not in seen_ids and show_id in shows_by_id:
+            seen_ids.add(show_id)
+            ordered_shows.append(shows_by_id[show_id])
+
+    results = [build_result_from_motn_show(s) for s in ordered_shows[:limit]]
+
+    if language in GROQ_TRANSLATE_LANGUAGES:
+        groq_semaphore = asyncio.Semaphore(4)
+
+        async def translate_one(result):
+            if result.get("overview"):
+                async with groq_semaphore:
+                    result["overview"] = await translate_overview_via_groq(result["overview"], language)
+
+        await asyncio.gather(*[translate_one(r) for r in results])
+
+    response = {"results": results, "count": len(results)}
+    cache_set(result_cache_key, response, ttl_seconds=recently_added_ttl)
+    return response
+
+
 @app.get("/api/title/{title_id}")
 async def get_title(title_id: str, language: str = Query("en", description="UI language")):
     """Fetches full details for one title by its IMDb id — used when someone
