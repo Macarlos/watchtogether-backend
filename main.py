@@ -510,6 +510,7 @@ async def discover(
     content_type: str = Query("movie", description="'movie' or 'tv_series'"),
     order_by: str = Query("popularity_1year", description="Sort order — the frontend randomizes this once per session for variety, since MOTN can't jump to a random page"),
     language: str = Query("en", description="UI language — only en/es/fr/de get passed to MOTN as output_language; pt/hi/pl aren't supported by MOTN so this stays English for the swipe deck (overview translation happens only on the detail view)"),
+    min_rating: int = Query(0, ge=0, le=10, description="Optional minimum rating on our 0-10 display scale (0 = no filter). Multiplied by 10 before being sent to MOTN, since MOTN's own rating_min filter is on a 0-100 scale."),
 ):
     if not MOTN_API_KEY:
         raise HTTPException(status_code=500, detail="MOTN_API_KEY is not configured on the server.")
@@ -542,7 +543,7 @@ async def discover(
                 seen_genres.add(g)
                 genre_ids.append(g)
 
-    result_cache_key = ("discover_result", tuple(sorted(catalogs)), tuple(genre_ids), region, motn_content_type, order_by, page, limit, motn_language, language)
+    result_cache_key = ("discover_result", tuple(sorted(catalogs)), tuple(genre_ids), region, motn_content_type, order_by, page, limit, motn_language, language, min_rating)
     cached = cache_get(result_cache_key)
     if cached is not None:
         _stats["cache_hits"] += 1
@@ -557,10 +558,10 @@ async def discover(
 
     # The poster wallpaper always calls with no platform/mood filter — cache
     # that combination far longer since it's purely decorative.
-    is_unfiltered = not platforms and not moods
+    is_unfiltered = not platforms and not moods and min_rating == 0
     discover_ttl = 604800 if is_unfiltered else 1200  # 7 days vs 20 minutes
 
-    page_cache_base = ("motn_page", tuple(sorted(catalogs)), tuple(genre_ids), region, motn_content_type, order_by, motn_language)
+    page_cache_base = ("motn_page", tuple(sorted(catalogs)), tuple(genre_ids), region, motn_content_type, order_by, motn_language, min_rating)
 
     async def fetch_motn_page(cursor):
         params = {"country": region.lower(), "show_type": motn_content_type}
@@ -573,6 +574,8 @@ async def discover(
             params["order_by"] = order_by
         if motn_language != "en":
             params["output_language"] = motn_language
+        if min_rating > 0:
+            params["rating_min"] = str(min_rating * 10)
         if cursor:
             params["cursor"] = cursor
 
