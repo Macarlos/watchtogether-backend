@@ -12,6 +12,8 @@ month, no card required) is built for exactly this use case.
 
 import os
 import re
+import json
+import calendar
 import asyncio
 import random
 import time
@@ -223,36 +225,72 @@ _stats = {
     "content_type_counts": defaultdict(int),
 }
 
-# ── Monthly credit budget safety net ──
-# Set via Render's environment variables — defaults to the free tier's 2,500.
-# Bump this to your actual plan size (e.g. 40000) once/if upgraded. This is
-# an estimate, not a precise billing counter (resets on redeploy, doesn't
-# know Watchmode's actual billing-cycle boundary) — it exists to keep a
-# runaway day from silently exhausting the whole month's quota with zero
-# warning, not to track spend to the credit.
-MONTHLY_CREDIT_BUDGET = int(os.environ.get("MONTHLY_CREDIT_BUDGET", "2500"))
-BUDGET_SOFT_THRESHOLD = 0.85  # cut off decorative/non-essential usage (the wallpaper) first
-BUDGET_HARD_THRESHOLD = 0.97  # cut off everything, including real browsing — better a
-                              # friendly "extra busy" message than the raw 502s Watchmode
-                              # itself returns once the quota is actually gone
+# ── MOTN usage tracking (persistent) ──
+# The rest of this file's counters (_stats) are in-memory only and reset on
+# every redeploy — fine for session-scoped stats, but useless for tracking
+# against a MONTHLY quota, since Render can redeploy several times a day
+# during active development. This writes to a small JSON file on disk
+# instead, so day/month totals survive a redeploy as long as the container's
+# disk isn't wiped (Render's standard ephemeral filesystem persists across
+# restarts within the same instance — it's only a fresh deploy from a new
+# image that risks resetting it, same caveat as everything else here).
+#
+# Replaces the old record_credits()/budget_ok() pair, which was defined but
+# never actually called from any real code path — so it always silently
+# reported zero usage. This one is wired into the real MOTN call sites below.
+MOTN_MONTHLY_QUOTA = int(os.environ.get("MOTN_MONTHLY_QUOTA", "100000"))  # set to your actual plan size
+ADMIN_KEY = os.environ.get("ADMIN_KEY", "")  # required to view /api/admin/usage — set this in Render's env vars
+USAGE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "motn_usage.json")
 
-_credits_used = 0
+def _load_usage():
+    try:
+        with open(USAGE_FILE, "r") as f:
+            data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        data = {}
+    today = time.strftime("%Y-%m-%d")
+    month = today[:7]
+    if data.get("day") != today:
+        data["day"] = today
+        data["day_count"] = 0
+    if data.get("month") != month:
+        data["month"] = month
+        data["month_count"] = 0
+        data["month_start_day_count"] = 0  # for the daily-average projection below
+    data.setdefault("day_count", 0)
+    data.setdefault("month_count", 0)
+    return data
 
-def record_credits(n):
-    global _credits_used
-    _credits_used += n
+def record_motn_call():
+    """Call this once per real HTTP request sent to MOTN — not per cached
+    response. Persists immediately; the call volume here is far too low
+    (one write per real API call, not per user) for disk I/O to matter."""
+    data = _load_usage()
+    data["day_count"] += 1
+    data["month_count"] += 1
+    try:
+        with open(USAGE_FILE, "w") as f:
+            json.dump(data, f)
+    except OSError:
+        pass  # tracking is best-effort — never let it break a real request
 
-def budget_ok(hard=False):
-    threshold = BUDGET_HARD_THRESHOLD if hard else BUDGET_SOFT_THRESHOLD
-    return _credits_used < MONTHLY_CREDIT_BUDGET * threshold
-
-def budget_info():
+def usage_info():
+    data = _load_usage()
+    now = time.localtime()
+    days_in_month = calendar.monthrange(now.tm_year, now.tm_mon)[1]
+    day_of_month = now.tm_mday
+    daily_average = data["month_count"] / day_of_month if day_of_month else 0
+    projected_month_total = round(daily_average * days_in_month)
     return {
-        "estimated_credits_used": _credits_used,
-        "monthly_credit_budget": MONTHLY_CREDIT_BUDGET,
-        "percent_used": round(100 * _credits_used / MONTHLY_CREDIT_BUDGET, 1) if MONTHLY_CREDIT_BUDGET else 0,
-        "conservation_mode": not budget_ok(),  # decorative/wallpaper requests paused
-        "hard_paused": not budget_ok(hard=True),  # everything paused, including real browsing
+        "today": data["day"],
+        "calls_today": data["day_count"],
+        "month": data["month"],
+        "calls_this_month": data["month_count"],
+        "monthly_quota": MOTN_MONTHLY_QUOTA,
+        "percent_of_quota_used": round(100 * data["month_count"] / MOTN_MONTHLY_QUOTA, 1) if MOTN_MONTHLY_QUOTA else 0,
+        "projected_month_end_total": projected_month_total,
+        "projected_to_exceed_quota": projected_month_total > MOTN_MONTHLY_QUOTA,
+        "daily_average_this_month": round(daily_average, 1),
     }
 
 def build_result_from_motn_show(show):
@@ -403,6 +441,7 @@ async def get_platforms(region: str = "US"):
             raise HTTPException(status_code=502, detail=f"MOTN error {r.status_code}: {r.text}")
 
         _stats["total_motn_api_calls"] += 1
+        record_motn_call()
 
     data = r.json()
     services = data.get("services", [])[:8]  # top 8 by popularity, per MOTN's own ordering
@@ -422,6 +461,22 @@ async def get_platforms(region: str = "US"):
     return response
 
 
+@app.get("/api/admin/usage")
+def admin_usage(key: str = Query("", description="Must match the ADMIN_KEY environment variable")):
+    """
+    Check real MOTN usage against your plan's monthly quota — today's
+    calls, this month's total, and a projected month-end total based on
+    your daily average pace so far, so you can see a trend forming and
+    upgrade proactively rather than being surprised by a sudden cutoff.
+    Protected by a simple shared-secret query param (set ADMIN_KEY in
+    Render's environment variables) since this exposes real operational
+    data, even though nothing personal/user-identifying.
+    """
+    if not ADMIN_KEY or key != ADMIN_KEY:
+        raise HTTPException(status_code=403, detail="Invalid or missing key.")
+    return usage_info()
+
+
 @app.get("/api/debug-discover")
 def debug_discover(stats_only: bool = Query(False, description="If true, skip the live Watchmode diagnostic calls and just return usage stats")):
     """
@@ -435,7 +490,7 @@ def debug_discover(stats_only: bool = Query(False, description="If true, skip th
     those without triggering the (credit-costing) diagnostic test calls.
     """
     if stats_only:
-        return {"current_stats": _stats, "budget": budget_info()}
+        return {"current_stats": _stats, "usage": usage_info()}
 
     if not WATCHMODE_API_KEY:
         raise HTTPException(status_code=500, detail="WATCHMODE_API_KEY is not configured on the server.")
@@ -496,7 +551,7 @@ def debug_discover(stats_only: bool = Query(False, description="If true, skip th
         result["sample_title_raw_fields"] = f"couldn't extract: {e}"
 
     result["current_stats"] = _stats
-    result["budget"] = budget_info()
+    result["usage"] = usage_info()
     return result
 
 
@@ -590,6 +645,7 @@ async def discover(
                     )
                     if r.status_code == 200:
                         _stats["total_motn_api_calls"] += 1
+                        record_motn_call()
                         return r.json()
                     last_error = f"MOTN error {r.status_code}: {r.text}"
                 except httpx.HTTPError as e:
@@ -702,6 +758,7 @@ async def recently_added(
                     )
                     if r.status_code == 200:
                         _stats["total_motn_api_calls"] += 1
+                        record_motn_call()
                         return r.json()
                     last_error = f"MOTN error {r.status_code}: {r.text}"
                 except httpx.HTTPError as e:
@@ -793,6 +850,7 @@ async def get_title(title_id: str, language: str = Query("en", description="UI l
             raise HTTPException(status_code=502, detail=f"MOTN error {r.status_code}: {r.text}")
 
         _stats["total_motn_api_calls"] += 1
+        record_motn_call()
 
     result = build_result_from_motn_show(r.json())
 
@@ -838,6 +896,7 @@ async def search_titles(
             raise HTTPException(status_code=502, detail=f"MOTN error {r.status_code}: {r.text}")
 
         _stats["total_motn_api_calls"] += 1
+        record_motn_call()
         # Defensive about response shape here — confirmed the filters endpoint
         # wraps results in {"shows": [...]}, but hadn't specifically verified
         # title search does the same before writing this, so handling both
@@ -887,6 +946,7 @@ async def get_titles(ids: str, language: str = Query("en", description="UI langu
                         )
                         if r.status_code == 200:
                             _stats["total_motn_api_calls"] += 1
+                            record_motn_call()
                             result = build_result_from_motn_show(r.json())
                             cache_set(cache_key, result, ttl_seconds=21600)
                             return result
@@ -931,6 +991,7 @@ async def movie_providers(title_id: str, region: str = "US"):
             raise HTTPException(status_code=502, detail=f"MOTN error {r.status_code}: {r.text}")
 
         _stats["total_motn_api_calls"] += 1
+        record_motn_call()
         show = r.json()
 
     options = show.get("streamingOptions", {}).get(region.lower(), [])
