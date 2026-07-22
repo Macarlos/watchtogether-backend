@@ -14,6 +14,7 @@ import os
 import re
 import json
 import calendar
+import datetime
 import asyncio
 import random
 import time
@@ -240,7 +241,27 @@ _stats = {
 # reported zero usage. This one is wired into the real MOTN call sites below.
 MOTN_MONTHLY_QUOTA = int(os.environ.get("MOTN_MONTHLY_QUOTA", "100000"))  # set to your actual plan size
 ADMIN_KEY = os.environ.get("ADMIN_KEY", "")  # required to view /api/admin/usage — set this in Render's env vars
+BILLING_CYCLE_DAY = int(os.environ.get("BILLING_CYCLE_DAY", "10"))  # day of month your MOTN subscription renews — confirmed from receipt, update if you ever change plans
 USAGE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "motn_usage.json")
+
+def _billing_period_start(d):
+    """Given a date, returns the date the current MOTN billing cycle started
+    — e.g. with BILLING_CYCLE_DAY=10, both July 15 and Aug 3 fall in the
+    cycle that started July 10, not the 1st of their respective calendar
+    months. Clamps to the last real day of a month if BILLING_CYCLE_DAY
+    (e.g. 31) doesn't exist in it."""
+    if d.day >= BILLING_CYCLE_DAY:
+        year, month = d.year, d.month
+    else:
+        year, month = (d.year - 1, 12) if d.month == 1 else (d.year, d.month - 1)
+    day = min(BILLING_CYCLE_DAY, calendar.monthrange(year, month)[1])
+    return datetime.date(year, month, day)
+
+def _next_billing_period_start(period_start):
+    year = period_start.year + (1 if period_start.month == 12 else 0)
+    month = 1 if period_start.month == 12 else period_start.month + 1
+    day = min(BILLING_CYCLE_DAY, calendar.monthrange(year, month)[1])
+    return datetime.date(year, month, day)
 
 def _load_usage():
     try:
@@ -248,17 +269,17 @@ def _load_usage():
             data = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         data = {}
-    today = time.strftime("%Y-%m-%d")
-    month = today[:7]
+    today_date = datetime.date.today()
+    today = today_date.isoformat()
+    period_label = _billing_period_start(today_date).isoformat()
     if data.get("day") != today:
         data["day"] = today
         data["day_count"] = 0
-    if data.get("month") != month:
-        data["month"] = month
-        data["month_count"] = 0
-        data["month_start_day_count"] = 0  # for the daily-average projection below
+    if data.get("period") != period_label:
+        data["period"] = period_label
+        data["period_count"] = 0
     data.setdefault("day_count", 0)
-    data.setdefault("month_count", 0)
+    data.setdefault("period_count", 0)
     return data
 
 def record_motn_call():
@@ -267,7 +288,7 @@ def record_motn_call():
     (one write per real API call, not per user) for disk I/O to matter."""
     data = _load_usage()
     data["day_count"] += 1
-    data["month_count"] += 1
+    data["period_count"] += 1
     try:
         with open(USAGE_FILE, "w") as f:
             json.dump(data, f)
@@ -276,21 +297,24 @@ def record_motn_call():
 
 def usage_info():
     data = _load_usage()
-    now = time.localtime()
-    days_in_month = calendar.monthrange(now.tm_year, now.tm_mon)[1]
-    day_of_month = now.tm_mday
-    daily_average = data["month_count"] / day_of_month if day_of_month else 0
-    projected_month_total = round(daily_average * days_in_month)
+    today_date = datetime.date.today()
+    period_start = _billing_period_start(today_date)
+    period_end = _next_billing_period_start(period_start)  # exclusive — this day starts the NEXT cycle
+    days_in_period = (period_end - period_start).days
+    day_of_period = (today_date - period_start).days + 1
+    daily_average = data["period_count"] / day_of_period if day_of_period else 0
+    projected_period_total = round(daily_average * days_in_period)
     return {
         "today": data["day"],
         "calls_today": data["day_count"],
-        "month": data["month"],
-        "calls_this_month": data["month_count"],
+        "billing_period_started": period_start.isoformat(),
+        "billing_period_ends": period_end.isoformat(),
+        "calls_this_period": data["period_count"],
         "monthly_quota": MOTN_MONTHLY_QUOTA,
-        "percent_of_quota_used": round(100 * data["month_count"] / MOTN_MONTHLY_QUOTA, 1) if MOTN_MONTHLY_QUOTA else 0,
-        "projected_month_end_total": projected_month_total,
-        "projected_to_exceed_quota": projected_month_total > MOTN_MONTHLY_QUOTA,
-        "daily_average_this_month": round(daily_average, 1),
+        "percent_of_quota_used": round(100 * data["period_count"] / MOTN_MONTHLY_QUOTA, 1) if MOTN_MONTHLY_QUOTA else 0,
+        "projected_period_end_total": projected_period_total,
+        "projected_to_exceed_quota": projected_period_total > MOTN_MONTHLY_QUOTA,
+        "daily_average_this_period": round(daily_average, 1),
     }
 
 def build_result_from_motn_show(show):
