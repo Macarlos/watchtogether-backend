@@ -86,14 +86,15 @@ def cache_get(key):
     entry = _ttl_cache.get(key)
     if entry is None:
         return None
-    expires_at, value = entry
+    expires_at, set_at, value = entry
     if time.time() > expires_at:
         del _ttl_cache[key]
         return None
     return value
 
 def cache_set(key, value, ttl_seconds):
-    _ttl_cache[key] = (time.time() + ttl_seconds, value)
+    now = time.time()
+    _ttl_cache[key] = (now + ttl_seconds, now, value)
     # Simple cap so this can't grow unbounded over a long-running process —
     # if it ever gets large, just drop the oldest quarter of entries.
     if len(_ttl_cache) > 500:
@@ -317,6 +318,40 @@ def usage_info():
         "daily_average_this_period": round(daily_average, 1),
     }
 
+
+def wallpaper_cache_status():
+    """Reports every currently-cached "unfiltered discover" (wallpaper)
+    entry — there isn't just one: each unique region/language/content-type/
+    order_by combination anyone has actually visited since the last redeploy
+    gets its own separate 7-day cache entry. Purely in-memory, so a redeploy
+    wipes all of these immediately regardless of how much of the 7 days
+    had elapsed — this reflects live reality, not a fixed schedule.
+    """
+    now = time.time()
+    entries = []
+    for key, (expires_at, set_at, _value) in _ttl_cache.items():
+        if not (isinstance(key, tuple) and len(key) >= 3 and key[0] == "discover_result"):
+            continue
+        catalogs, genre_ids = key[1], key[2]
+        if catalogs or genre_ids:
+            continue  # a real filtered search, not the decorative wallpaper
+        _, _, _, region, content_type, order_by, page, limit, motn_language, language, min_rating = key
+        entries.append({
+            "region": region,
+            "content_type": content_type,
+            "language": language,
+            "order_by": order_by,
+            "set_at": datetime.datetime.fromtimestamp(set_at).isoformat(timespec="seconds"),
+            "age_seconds": round(now - set_at),
+            "expires_at": datetime.datetime.fromtimestamp(expires_at).isoformat(timespec="seconds"),
+            "seconds_until_expiry": round(expires_at - now),
+        })
+    entries.sort(key=lambda e: e["set_at"], reverse=True)
+    return {
+        "cached_wallpaper_variants": len(entries),
+        "entries": entries,
+    }
+
 def build_result_from_motn_show(show):
     """Maps a raw Movie of the Night 'show' object into the exact same shape
     build_result_from_details produces, so the frontend needs zero changes
@@ -492,13 +527,15 @@ def admin_usage(key: str = Query("", description="Must match the ADMIN_KEY envir
     calls, this month's total, and a projected month-end total based on
     your daily average pace so far, so you can see a trend forming and
     upgrade proactively rather than being surprised by a sudden cutoff.
+    Also reports the live state of the wallpaper's cache entries (see
+    wallpaper_cache_status for why there's more than one).
     Protected by a simple shared-secret query param (set ADMIN_KEY in
     Render's environment variables) since this exposes real operational
     data, even though nothing personal/user-identifying.
     """
     if not ADMIN_KEY or key != ADMIN_KEY:
         raise HTTPException(status_code=403, detail="Invalid or missing key.")
-    return usage_info()
+    return {**usage_info(), "wallpaper_cache": wallpaper_cache_status()}
 
 
 @app.get("/api/debug-discover")
