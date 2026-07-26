@@ -1020,6 +1020,36 @@ async def get_titles(ids: str, language: str = Query("en", description="UI langu
     return {"results": [r for r in results if r]}
 
 
+async def fetch_motn_show_raw(title_id, region):
+    """Fetches a single show's full raw MOTN object by IMDb id, shared and
+    cached across any endpoint that needs it (providers, similar-titles) so
+    viewing both for the same title only costs one real MOTN call, not two.
+    Cached for 24h — a show's genres/metadata don't change day to day, only
+    its streaming availability does (which providers extracts from this same
+    response but doesn't itself get long-cached, for that reason)."""
+    cache_key = ("show_raw", title_id, region)
+    cached = cache_get(cache_key)
+    if cached is not None:
+        _stats["cache_hits"] += 1
+        return cached
+    async with httpx.AsyncClient(timeout=15) as client:
+        try:
+            r = await client.get(
+                f"{MOTN_BASE}/shows/{title_id}",
+                params={"country": region.lower()},
+                headers={"X-API-Key": MOTN_API_KEY},
+            )
+        except httpx.HTTPError as e:
+            raise HTTPException(status_code=502, detail=f"MOTN request failed: {e}")
+        if r.status_code != 200:
+            raise HTTPException(status_code=502, detail=f"MOTN error {r.status_code}: {r.text}")
+        _stats["total_motn_api_calls"] += 1
+        record_motn_call()
+        show = r.json()
+    cache_set(cache_key, show, ttl_seconds=86400)
+    return show
+
+
 @app.get("/api/movie/{title_id}/providers")
 async def movie_providers(title_id: str, region: str = "US"):
     """title_id is now an IMDb id (e.g. 'tt0068646') — MOTN's /shows/{id}
@@ -1039,21 +1069,7 @@ async def movie_providers(title_id: str, region: str = "US"):
         _stats["cache_hits"] += 1
         return cached
 
-    async with httpx.AsyncClient(timeout=15) as client:
-        try:
-            r = await client.get(
-                f"{MOTN_BASE}/shows/{title_id}",
-                params={"country": region.lower()},
-                headers={"X-API-Key": MOTN_API_KEY},
-            )
-        except httpx.HTTPError as e:
-            raise HTTPException(status_code=502, detail=f"MOTN request failed: {e}")
-        if r.status_code != 200:
-            raise HTTPException(status_code=502, detail=f"MOTN error {r.status_code}: {r.text}")
-
-        _stats["total_motn_api_calls"] += 1
-        record_motn_call()
-        show = r.json()
+    show = await fetch_motn_show_raw(title_id, region)
 
     options = show.get("streamingOptions", {}).get(region.lower(), [])
 
@@ -1097,3 +1113,82 @@ async def movie_providers(title_id: str, region: str = "US"):
     cache_set(cache_key, response, ttl_seconds=3600)
     return response
 
+
+@app.get("/api/similar/{title_id}")
+async def similar_titles(
+    title_id: str,
+    platforms: str = Query("", description="Comma-separated platform ids — same catalogs the person already selected"),
+    region: str = Query("US"),
+    content_type: str = Query("movie", description="'movie' or 'tv_series'"),
+    language: str = Query("en"),
+    limit: int = Query(12),
+):
+    """"Similar to X" — genre-based, not true content-similarity (MOTN has
+    no recommendations endpoint of its own; that would need a second data
+    source like TMDB layered on top, a bigger separate step). This looks up
+    the title's own genres, then searches for other titles sharing at least
+    one of them on the same platforms — same underlying mechanism as mood
+    filtering elsewhere in this file, just genre-seeded by an existing title
+    instead of a person's mood pick.
+    """
+    if not MOTN_API_KEY:
+        raise HTTPException(status_code=500, detail="MOTN_API_KEY is not configured on the server.")
+
+    region = region.upper() if region.upper() in SUPPORTED_REGIONS else DEFAULT_REGION
+    motn_language = language if language in MOTN_NATIVE_LANGUAGES else "en"
+    motn_content_type = "series" if content_type == "tv_series" else "movie"
+    catalogs = [p for p in platforms.split(",") if p and re.fullmatch(r"[a-z0-9_]+", p)]
+
+    cache_key = ("similar", title_id, tuple(sorted(catalogs)), region, motn_content_type, motn_language, language, limit)
+    cached = cache_get(cache_key)
+    if cached is not None:
+        _stats["cache_hits"] += 1
+        return cached
+
+    show = await fetch_motn_show_raw(title_id, region)
+    genre_ids = [g.get("id") for g in show.get("genres", []) if g.get("id")]
+    if not genre_ids:
+        response = {"results": []}
+        cache_set(cache_key, response, ttl_seconds=86400)
+        return response
+
+    params = {
+        "country": region.lower(),
+        "show_type": motn_content_type,
+        "genres": ",".join(genre_ids),
+        "genres_relation": "or",
+        "order_by": "rating",
+    }
+    if catalogs:
+        params["catalogs"] = ",".join(catalogs)
+    if motn_language != "en":
+        params["output_language"] = motn_language
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        try:
+            r = await client.get(
+                f"{MOTN_BASE}/shows/search/filters",
+                params=params,
+                headers={"X-API-Key": MOTN_API_KEY},
+            )
+        except httpx.HTTPError as e:
+            raise HTTPException(status_code=502, detail=f"MOTN request failed: {e}")
+        if r.status_code != 200:
+            raise HTTPException(status_code=502, detail=f"MOTN error {r.status_code}: {r.text}")
+        _stats["total_motn_api_calls"] += 1
+        record_motn_call()
+        data = r.json()
+
+    results = []
+    for s in data.get("shows", []):
+        if s.get("imdbId") == title_id:
+            continue  # never recommend the title itself
+        results.append(build_result_from_motn_show(s))
+        if len(results) >= limit:
+            break
+
+    response = {"results": results}
+    # Same 24h reasoning as the raw-show cache above — a title's set of
+    # genre-mates doesn't meaningfully shift day to day.
+    cache_set(cache_key, response, ttl_seconds=86400)
+    return response
