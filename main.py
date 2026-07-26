@@ -538,6 +538,47 @@ def admin_usage(key: str = Query("", description="Must match the ADMIN_KEY envir
     return {**usage_info(), "wallpaper_cache": wallpaper_cache_status()}
 
 
+@app.get("/api/admin/all-platforms")
+async def admin_all_platforms(
+    region: str = Query("US"),
+    key: str = Query("", description="Must match the ADMIN_KEY environment variable"),
+):
+    """The regular /api/platforms endpoint deliberately trims MOTN's country
+    catalog list down to the top 8 by popularity, since that's all the app's
+    own platform picker needs. This returns everything MOTN actually
+    reports for that country — useful for checking whether a specific
+    regional service (e.g. Player.pl for Poland) is in MOTN's data at all,
+    even if it doesn't rank high enough to appear in the app's picker.
+    """
+    if not ADMIN_KEY or key != ADMIN_KEY:
+        raise HTTPException(status_code=403, detail="Invalid or missing key.")
+
+    region = region.upper() if region.upper() in SUPPORTED_REGIONS else DEFAULT_REGION
+    if not MOTN_API_KEY:
+        raise HTTPException(status_code=500, detail="MOTN_API_KEY is not configured on the server.")
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        try:
+            r = await client.get(
+                f"{MOTN_BASE}/countries/{region.lower()}",
+                headers={"X-API-Key": MOTN_API_KEY},
+            )
+        except httpx.HTTPError as e:
+            raise HTTPException(status_code=502, detail=f"MOTN request failed: {e}")
+        if r.status_code != 200:
+            raise HTTPException(status_code=502, detail=f"MOTN error {r.status_code}: {r.text}")
+        _stats["total_motn_api_calls"] += 1
+        record_motn_call()
+        data = r.json()
+
+    services = data.get("services", [])
+    return {
+        "region": region,
+        "total_services": len(services),
+        "services": [{"id": s.get("id"), "name": s.get("name")} for s in services],
+    }
+
+
 @app.get("/api/debug-discover")
 def debug_discover(stats_only: bool = Query(False, description="If true, skip the live Watchmode diagnostic calls and just return usage stats")):
     """
