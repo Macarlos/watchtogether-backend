@@ -778,15 +778,11 @@ async def discover(
     shows = (page_data or {}).get("shows", [])
     results = [build_result_from_motn_show(s) for s in shows[:limit]]
 
-    if language in GROQ_TRANSLATE_LANGUAGES:
-        groq_semaphore = asyncio.Semaphore(4)
-
-        async def translate_one(result):
-            if result.get("overview"):
-                async with groq_semaphore:
-                    result["overview"] = await translate_overview_via_groq(result["overview"], language)
-
-        await asyncio.gather(*[translate_one(r) for r in results])
+    # Translation used to happen here, eagerly, for every card in every
+    # batch — burning up to a whole batch's worth of Groq's 30-req/min free
+    # tier on cards that might never even get their summary opened. Moved
+    # to /api/translate-overview, called on-demand only when someone
+    # actually opens a given card's summary — see that endpoint's docstring.
 
     response = {"results": results, "count": len(results)}
     cache_set(result_cache_key, response, ttl_seconds=discover_ttl)
@@ -902,15 +898,9 @@ async def recently_added(
 
     results = [build_result_from_motn_show(s) for s in ordered_shows[:limit]]
 
-    if language in GROQ_TRANSLATE_LANGUAGES:
-        groq_semaphore = asyncio.Semaphore(4)
-
-        async def translate_one(result):
-            if result.get("overview"):
-                async with groq_semaphore:
-                    result["overview"] = await translate_overview_via_groq(result["overview"], language)
-
-        await asyncio.gather(*[translate_one(r) for r in results])
+    # Same reasoning as /api/discover — translation moved to the on-demand
+    # /api/translate-overview endpoint instead of happening eagerly here
+    # for every card in the batch.
 
     response = {"results": results, "count": len(results)}
     cache_set(result_cache_key, response, ttl_seconds=recently_added_ttl)
