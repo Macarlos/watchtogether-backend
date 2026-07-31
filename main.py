@@ -18,6 +18,7 @@ import datetime
 import asyncio
 import random
 import time
+import itertools
 from urllib.parse import quote_plus
 from collections import defaultdict
 import httpx
@@ -1022,6 +1023,59 @@ async def get_title(title_id: str, language: str = Query("en", description="UI l
     return result
 
 
+# Polish letters that can plausibly take an accent, and what they map to.
+# 'z' is ambiguous — both ż and ź exist — so both are offered as candidates
+# rather than guessing one.
+_PL_ACCENT_MAP = {"s": "ś", "c": "ć", "n": "ń", "l": "ł", "a": "ą", "o": "ó", "e": "ę"}
+
+def generate_pl_accent_variants(text, max_variants=15):
+    """Generates candidate accented/capitalized versions of a search query,
+    for retrying against MOTN when the plain-typed version returns nothing —
+    e.g. Polish "tesciowie" should still find "Teściowie". Tried in order of
+    fewest changes first (capitalization alone, then one accent at a time,
+    then two at a time, ...), capped at max_variants total so a query that
+    genuinely doesn't match anything doesn't burn unbounded extra MOTN calls
+    trying every possible accent combination.
+    """
+    chars = list(text)
+    positions = []  # (char index, [original, accented alternative(s)])
+    for i, ch in enumerate(chars):
+        lower = ch.lower()
+        if lower == "z":
+            z_upper = ch.isupper()
+            positions.append((i, [ch, "Ż" if z_upper else "ż", "Ź" if z_upper else "ź"]))
+        elif lower in _PL_ACCENT_MAP:
+            accented = _PL_ACCENT_MAP[lower]
+            positions.append((i, [ch, accented.upper() if ch.isupper() else accented]))
+
+    cap_variants = [False, True] if text[:1].islower() else [False]
+    seen, results = set(), []
+    n = len(positions)
+    for distance in range(0, n + 1):
+        if len(results) >= max_variants:
+            break
+        for combo in itertools.combinations(range(n), distance):
+            if len(results) >= max_variants:
+                break
+            alt_lists = [positions[idx][1][1:] for idx in combo]
+            for alt_combo in (itertools.product(*alt_lists) if alt_lists else [()]):
+                if len(results) >= max_variants:
+                    break
+                new_chars = chars.copy()
+                for idx, alt_char in zip(combo, alt_combo):
+                    new_chars[positions[idx][0]] = alt_char
+                for cap in cap_variants:
+                    candidate = "".join(new_chars)
+                    if cap:
+                        candidate = candidate[:1].upper() + candidate[1:]
+                    if candidate != text and candidate not in seen:
+                        seen.add(candidate)
+                        results.append(candidate)
+                        if len(results) >= max_variants:
+                            break
+    return results
+
+
 @app.get("/api/search")
 async def search_titles(
     query: str,
@@ -1039,36 +1093,48 @@ async def search_titles(
     motn_language = language if language in MOTN_NATIVE_LANGUAGES else "en"
     region = region.upper() if region.upper() in SUPPORTED_REGIONS else DEFAULT_REGION
 
-    async with httpx.AsyncClient(timeout=15) as client:
-        try:
-            search_params = {"title": query, "show_type": wanted_type, "country": region.lower()}
-            if motn_language != "en":
-                search_params["output_language"] = motn_language
-            r = await client.get(
-                f"{MOTN_BASE}/shows/search/title",
-                params=search_params,
-                headers={"X-API-Key": MOTN_API_KEY},
-            )
-        except httpx.HTTPError as e:
-            raise HTTPException(status_code=502, detail=f"MOTN request failed: {e}")
-        if r.status_code != 200:
-            raise HTTPException(status_code=502, detail=f"MOTN error {r.status_code}: {r.text}")
+    async def run_motn_search(title_text):
+        async with httpx.AsyncClient(timeout=15) as client:
+            try:
+                search_params = {"title": title_text, "show_type": wanted_type, "country": region.lower()}
+                if motn_language != "en":
+                    search_params["output_language"] = motn_language
+                r = await client.get(
+                    f"{MOTN_BASE}/shows/search/title",
+                    params=search_params,
+                    headers={"X-API-Key": MOTN_API_KEY},
+                )
+            except httpx.HTTPError as e:
+                raise HTTPException(status_code=502, detail=f"MOTN request failed: {e}")
+            if r.status_code != 200:
+                raise HTTPException(status_code=502, detail=f"MOTN error {r.status_code}: {r.text}")
 
-        _stats["total_motn_api_calls"] += 1
-        record_motn_call()
-        # Defensive about response shape here — confirmed the filters endpoint
-        # wraps results in {"shows": [...]}, but hadn't specifically verified
-        # title search does the same before writing this, so handling both
-        # possibilities rather than assuming.
-        parsed = r.json()
-        shows = parsed if isinstance(parsed, list) else parsed.get("shows", [])
+            _stats["total_motn_api_calls"] += 1
+            record_motn_call()
+            # Defensive about response shape here — confirmed the filters endpoint
+            # wraps results in {"shows": [...]}, but hadn't specifically verified
+            # title search does the same before writing this, so handling both
+            # possibilities rather than assuming.
+            parsed = r.json()
+            shows = parsed if isinstance(parsed, list) else parsed.get("shows", [])
+        # Defensive filter in case show_type isn't fully respected server-side —
+        # matches the old Watchmode implementation's same defensive habit.
+        return [
+            build_result_from_motn_show(s) for s in shows
+            if s.get("showType") == wanted_type
+        ][:10]
 
-    # Defensive filter in case show_type isn't fully respected server-side —
-    # matches the old Watchmode implementation's same defensive habit.
-    results = [
-        build_result_from_motn_show(s) for s in shows
-        if s.get("showType") == wanted_type
-    ][:10]
+    results = await run_motn_search(query)
+
+    # Only for Polish, and only when the plain query truly found nothing —
+    # this is the actual reported case (typing "tesciowie" without accents
+    # failing to find "Teściowie"). Stops at the first variant that returns
+    # anything, so this is usually just 1 extra call, not the full 15.
+    if not results and language == "pl":
+        for variant in generate_pl_accent_variants(query):
+            results = await run_motn_search(variant)
+            if results:
+                break
 
     return {"results": results, "count": len(results)}
 
