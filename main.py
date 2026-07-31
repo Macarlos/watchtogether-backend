@@ -822,7 +822,9 @@ async def recently_added(
     cached = cache_get(result_cache_key)
     if cached is not None:
         _stats["cache_hits"] += 1
-        return cached
+        shuffled = cached["results"].copy()
+        random.shuffle(shuffled)
+        return {"results": shuffled, "count": len(shuffled)}
 
     # Changes reflect real calendar time (something new could land on a
     # platform any hour), so this refreshes far more often than the regular
@@ -904,7 +906,13 @@ async def recently_added(
 
     response = {"results": results, "count": len(results)}
     cache_set(result_cache_key, response, ttl_seconds=recently_added_ttl)
-    return response
+
+    # Shuffled on the way out (cache stores the canonical recency-ordered
+    # list) — otherwise every visitor within the same hour-long cache window
+    # would see the exact same order every time they opened this section.
+    shuffled = results.copy()
+    random.shuffle(shuffled)
+    return {"results": shuffled, "count": len(shuffled)}
 
 
 @app.get("/api/title/{title_id}")
@@ -1174,7 +1182,9 @@ async def similar_titles(
     cached = cache_get(cache_key)
     if cached is not None:
         _stats["cache_hits"] += 1
-        return cached
+        shuffled = cached["results"].copy()
+        random.shuffle(shuffled)
+        return {"results": shuffled}
 
     show = await fetch_motn_show_raw(title_id, region)
     genre_ids = [g.get("id") for g in show.get("genres", []) if g.get("id")]
@@ -1222,4 +1232,9 @@ async def similar_titles(
     # Same 24h reasoning as the raw-show cache above — a title's set of
     # genre-mates doesn't meaningfully shift day to day.
     cache_set(cache_key, response, ttl_seconds=86400)
-    return response
+
+    # Shuffled on the way out — otherwise the same title always showed the
+    # exact same top-rated genre-mates in the exact same order every time.
+    shuffled = results.copy()
+    random.shuffle(shuffled)
+    return {"results": shuffled}
