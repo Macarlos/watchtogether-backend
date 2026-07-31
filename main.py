@@ -125,6 +125,15 @@ LANGUAGE_NAMES = {"pt": "Portuguese", "hi": "Hindi", "pl": "Polish"}
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GROQ_BASE = "https://api.groq.com/openai/v1"
+
+# YouTube Data API v3 — used to find an actual specific trailer video, on
+# demand, instead of just linking to a YouTube search. Free tier: 10,000
+# quota units/day; a search.list call costs 100 units, so roughly 100
+# real trailer lookups/day before hitting the ceiling. Get a key from
+# https://console.cloud.google.com — enable "YouTube Data API v3", then
+# create an API key under Credentials.
+YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY", "")
+YOUTUBE_SEARCH_BASE = "https://www.googleapis.com/youtube/v3/search"
 # gpt-oss-20b — Groq's recommended fast/cheap model as of their June 2026
 # deprecation of llama-3.1-8b-instant. Plenty capable for a short synopsis.
 GROQ_MODEL = "openai/gpt-oss-20b"
@@ -913,6 +922,56 @@ async def recently_added(
     shuffled = results.copy()
     random.shuffle(shuffled)
     return {"results": shuffled, "count": len(shuffled)}
+
+
+@app.get("/api/trailer")
+async def find_trailer(
+    title: str = Query(..., description="Movie/show title"),
+    year: str = Query("", description="Release year, improves match accuracy"),
+):
+    """Finds one specific, real trailer video via YouTube's search API,
+    instead of just linking to a YouTube search results page. Called
+    on-demand — only when someone actually opens a title's details and
+    taps to watch the trailer, not eagerly for every card in a batch,
+    since YouTube's free tier only allows ~100 searches/day and most
+    swiped cards never get this far. Cached for 90 days per title+year,
+    since a movie's trailer is effectively permanent.
+    """
+    if not YOUTUBE_API_KEY:
+        return {"video_id": None}
+
+    cache_key = ("trailer", title.lower().strip(), year)
+    cached = cache_get(cache_key)
+    if cached is not None:
+        _stats["cache_hits"] += 1
+        return cached
+
+    query = f"{title} {year} official trailer" if year else f"{title} official trailer"
+    params = {
+        "key": YOUTUBE_API_KEY,
+        "q": query,
+        "part": "snippet",
+        "type": "video",
+        "maxResults": 1,
+        "videoEmbeddable": "true",
+        "safeSearch": "moderate",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(YOUTUBE_SEARCH_BASE, params=params)
+    except httpx.HTTPError:
+        return {"video_id": None}  # trailer is a nice-to-have — never break the page over it
+
+    if r.status_code != 200:
+        # Out of quota, bad key, etc. — fail soft, same reasoning as above.
+        return {"video_id": None}
+
+    items = r.json().get("items", [])
+    video_id = items[0]["id"]["videoId"] if items and items[0].get("id", {}).get("videoId") else None
+
+    response = {"video_id": video_id}
+    cache_set(cache_key, response, ttl_seconds=90 * 86400)
+    return response
 
 
 @app.get("/api/title/{title_id}")
