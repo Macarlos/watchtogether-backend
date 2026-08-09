@@ -96,10 +96,30 @@ def cache_get(key):
 def cache_set(key, value, ttl_seconds):
     now = time.time()
     _ttl_cache[key] = (now + ttl_seconds, now, value)
-    # Simple cap so this can't grow unbounded over a long-running process —
-    # if it ever gets large, just drop the oldest quarter of entries.
+
+    # Proactively drop anything that's already expired. cache_get() only
+    # clears an entry when that exact key is looked up again — a one-off
+    # filter combination someone tries once (very common with real, varied
+    # tester traffic: different region/mood/genre/language combos) would
+    # otherwise sit in memory forever after its TTL passes, since nothing
+    # else ever revisits that key to trigger the lazy cleanup in cache_get.
+    # This was the actual driver behind the steady memory climb Render
+    # flagged — not a single traffic spike, and not runaway growth outside
+    # this cache, just dead entries never being swept.
+    expired_keys = [k for k, (expires_at, _, _) in _ttl_cache.items() if expires_at <= now]
+    for k in expired_keys:
+        del _ttl_cache[k]
+
+    # Hard cap as a backstop for pathological cases (e.g. many long-TTL
+    # entries — translations cached 30 days, trailers 90 — that are all
+    # still genuinely valid and wouldn't get caught by the sweep above).
+    # Evict the truly oldest-inserted entries (by set_at) rather than the
+    # ones soonest to expire — the previous version's sort key meant a
+    # long-TTL entry could sit untouched indefinitely while short-TTL,
+    # still-valid entries got evicted first, which is backwards for
+    # actually reclaiming memory.
     if len(_ttl_cache) > 500:
-        oldest_keys = sorted(_ttl_cache, key=lambda k: _ttl_cache[k][0])[:125]
+        oldest_keys = sorted(_ttl_cache, key=lambda k: _ttl_cache[k][1])[:125]
         for k in oldest_keys:
             del _ttl_cache[k]
 
