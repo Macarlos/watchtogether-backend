@@ -19,7 +19,6 @@ import asyncio
 import random
 import time
 import itertools
-import logging
 from urllib.parse import quote_plus
 from collections import defaultdict
 import httpx
@@ -27,9 +26,6 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("watch2night")
 
 app = FastAPI(title="Watch2Night API")
 
@@ -100,30 +96,10 @@ def cache_get(key):
 def cache_set(key, value, ttl_seconds):
     now = time.time()
     _ttl_cache[key] = (now + ttl_seconds, now, value)
-
-    # Proactively drop anything that's already expired. cache_get() only
-    # clears an entry when that exact key is looked up again — a one-off
-    # filter combination someone tries once (very common with real, varied
-    # tester traffic: different region/mood/genre/language combos) would
-    # otherwise sit in memory forever after its TTL passes, since nothing
-    # else ever revisits that key to trigger the lazy cleanup in cache_get.
-    # This was the actual driver behind the steady memory climb Render
-    # flagged — not a single traffic spike, and not runaway growth outside
-    # this cache, just dead entries never being swept.
-    expired_keys = [k for k, (expires_at, _, _) in _ttl_cache.items() if expires_at <= now]
-    for k in expired_keys:
-        del _ttl_cache[k]
-
-    # Hard cap as a backstop for pathological cases (e.g. many long-TTL
-    # entries — translations cached 30 days, trailers 90 — that are all
-    # still genuinely valid and wouldn't get caught by the sweep above).
-    # Evict the truly oldest-inserted entries (by set_at) rather than the
-    # ones soonest to expire — the previous version's sort key meant a
-    # long-TTL entry could sit untouched indefinitely while short-TTL,
-    # still-valid entries got evicted first, which is backwards for
-    # actually reclaiming memory.
+    # Simple cap so this can't grow unbounded over a long-running process —
+    # if it ever gets large, just drop the oldest quarter of entries.
     if len(_ttl_cache) > 500:
-        oldest_keys = sorted(_ttl_cache, key=lambda k: _ttl_cache[k][1])[:125]
+        oldest_keys = sorted(_ttl_cache, key=lambda k: _ttl_cache[k][0])[:125]
         for k in oldest_keys:
             del _ttl_cache[k]
 
@@ -898,7 +874,6 @@ async def recently_added(
                 except httpx.HTTPError as e:
                     last_error = f"MOTN request failed: {e}"
                 await asyncio.sleep(0.8)
-        logger.error("recently-added: MOTN /changes failed after 3 attempts — %s", last_error)
         raise HTTPException(status_code=502, detail=last_error or "MOTN request failed after retries")
 
     page_num = 1
@@ -911,11 +886,7 @@ async def recently_added(
             page_data = cached_page
         else:
             page_data = await fetch_motn_page(cursor)
-            # Same short-TTL-for-empty reasoning as the result cache below —
-            # a page with no changes on it shouldn't get locked in for a
-            # full hour if it was actually a transient upstream blip.
-            page_has_data = bool(page_data.get("changes"))
-            cache_set(this_page_key, page_data, ttl_seconds=recently_added_ttl if page_has_data else 120)
+            cache_set(this_page_key, page_data, ttl_seconds=recently_added_ttl)
         cursor = page_data.get("nextCursor")
         if page_num < page and not page_data.get("hasMore"):
             break  # ran out of pages before reaching the requested one
@@ -923,21 +894,6 @@ async def recently_added(
 
     changes = (page_data or {}).get("changes", [])
     shows_by_id = (page_data or {}).get("shows", {})
-
-    if not changes:
-        # Empty is either genuinely "nothing new right now" or a sign MOTN
-        # sent back something other than the expected {"changes": [...],
-        # "shows": {...}} shape (e.g. a plan-restriction notice with a 200
-        # status, which fetch_motn_page's status_code check wouldn't catch).
-        # Logging the raw keys here costs nothing on the happy path and
-        # means the next occurrence is diagnosable from Render's log viewer
-        # instead of requiring another round of manual testing.
-        logger.info(
-            "recently-added: empty changes for region=%s catalogs=%s content_type=%s — raw page_data keys: %s, sample: %s",
-            region, catalogs, motn_content_type,
-            list((page_data or {}).keys()),
-            str(page_data)[:500],
-        )
 
     # A show can have more than one change entry on the same page (e.g. it
     # was added on two services the same day) — dedupe while preserving the
@@ -959,15 +915,7 @@ async def recently_added(
     # for every card in the batch.
 
     response = {"results": results, "count": len(results)}
-    # Don't cache a genuinely empty result at the full 1-hour TTL. An empty
-    # response and a transient upstream hiccup (a momentary blip at MOTN,
-    # an over-narrow query that happens to match nothing right now, etc.)
-    # look identical from here — caching it for a full hour would mean any
-    # transient emptiness looks "stuck" for an hour even after the real
-    # data would have shown up again. A short TTL still gets the caching
-    # benefit for genuinely quiet periods without that downside.
-    empty_result_ttl = 120
-    cache_set(result_cache_key, response, ttl_seconds=recently_added_ttl if results else empty_result_ttl)
+    cache_set(result_cache_key, response, ttl_seconds=recently_added_ttl)
 
     # Shuffled on the way out (cache stores the canonical recency-ordered
     # list) — otherwise every visitor within the same hour-long cache window
