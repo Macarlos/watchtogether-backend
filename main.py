@@ -159,52 +159,75 @@ GROQ_BASE = "https://api.groq.com/openai/v1"
 # create an API key under Credentials.
 YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY", "")
 YOUTUBE_SEARCH_BASE = "https://www.googleapis.com/youtube/v3/search"
-# gpt-oss-20b — Groq's recommended fast/cheap model as of their June 2026
-# deprecation of llama-3.1-8b-instant. Plenty capable for a short synopsis.
-GROQ_MODEL = "openai/gpt-oss-20b"
+# gpt-oss-120b — upgraded from the 20b variant for translation quality.
+# Same Groq-hosted family/API (drop-in model name swap), explicitly built
+# for multilingual quality across 80+ languages. The cost difference is
+# negligible here: this only runs once per title view, and a successful
+# translation is cached for 30 days, so the extra per-call cost is paid
+# once per title/language combo, not per request.
+GROQ_MODEL = "openai/gpt-oss-120b"
 
 async def translate_overview_via_groq(text, target_lang):
     """Translates a movie/show overview into a language MOTN doesn't support
     natively. Deliberately narrow in scope — only called when someone views
     a title's full details (not per swipe-deck card), since Groq's free tier
     caps at 30 requests/minute and this needs to never be the bottleneck.
-    Falls back to the original English text on any failure — a missing
-    translation is far better than a broken detail page."""
+    Retries a couple of times on transient failures (rate limits, timeouts)
+    before giving up — a single Groq hiccup shouldn't mean no translation
+    at all. Falls back to the original English text only if every attempt
+    fails; a missing translation is far better than a broken detail page."""
     if not GROQ_API_KEY or not text:
-        return text
+        return text, False
 
     cache_key = ("groq_overview", hash(text), target_lang)
     cached = cache_get(cache_key)
     if cached is not None:
-        return cached
+        return cached, True
 
     language_name = LANGUAGE_NAMES.get(target_lang, target_lang)
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.post(
-                f"{GROQ_BASE}/chat/completions",
-                headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-                json={
-                    "model": GROQ_MODEL,
-                    "messages": [
-                        {
-                            "role": "system",
-                            "content": f"You translate movie and TV show synopses into {language_name}. Reply with ONLY the translated text — no quotes, no commentary, no explanation.",
-                        },
-                        {"role": "user", "content": text},
-                    ],
-                    "temperature": 0.3,
-                },
-            )
-            if r.status_code == 200:
-                translated = r.json()["choices"][0]["message"]["content"].strip()
-                if translated:
-                    # Long TTL — a synopsis translation never changes once done.
-                    cache_set(cache_key, translated, ttl_seconds=2592000)  # 30 days
-                    return translated
-    except Exception:
-        pass
-    return text
+    last_error = None
+    for attempt in range(3):
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                r = await client.post(
+                    f"{GROQ_BASE}/chat/completions",
+                    headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+                    json={
+                        "model": GROQ_MODEL,
+                        "messages": [
+                            {
+                                "role": "system",
+                                "content": (
+                                    f"You are a professional translator localizing movie and TV show "
+                                    f"synopses into {language_name} for a streaming guide app. Translate "
+                                    f"naturally and idiomatically, the way a native {language_name} speaker "
+                                    f"would actually phrase it — not a literal word-for-word rendering. "
+                                    f"Keep the same tone (concise, engaging, marketing-appropriate) and "
+                                    f"preserve names, titles, and factual details exactly. "
+                                    f"Reply with ONLY the translated text — no quotes, no commentary, no explanation."
+                                ),
+                            },
+                            {"role": "user", "content": text},
+                        ],
+                        "temperature": 0.3,
+                    },
+                )
+                if r.status_code == 200:
+                    translated = r.json()["choices"][0]["message"]["content"].strip()
+                    if translated:
+                        # Long TTL — a synopsis translation never changes once done.
+                        cache_set(cache_key, translated, ttl_seconds=2592000)  # 30 days
+                        return translated, True
+                    last_error = "Groq returned an empty translation"
+                else:
+                    last_error = f"Groq error {r.status_code}: {r.text}"
+        except Exception as e:
+            last_error = f"Groq request failed: {e}"
+        if attempt < 2:
+            await asyncio.sleep(1.5)
+
+    logger.error("translate_overview_via_groq: failed after 3 attempts — %s", last_error)
+    return text, False
 
 # Catalog ids are identical to what Watch2Night already uses internally —
 # confirmed via a live call to /countries/us, no mapping needed at all.
@@ -1073,12 +1096,21 @@ async def get_title(title_id: str, language: str = Query("en", description="UI l
 
     result = build_result_from_motn_show(r.json())
 
+    translation_ok = True
     if needs_groq and result.get("overview"):
-        result["overview"] = await translate_overview_via_groq(result["overview"], language)
+        result["overview"], translation_ok = await translate_overview_via_groq(result["overview"], language)
 
     # 6 hour TTL — title metadata (description, cast, poster) barely ever
     # changes, so this can be cached far longer than availability/pricing.
-    cache_set(cache_key, result, ttl_seconds=21600)
+    # BUT: if the Groq translation failed and fell back to English, don't
+    # bake that into the long cache — this was the actual cause of
+    # "translation doesn't happen sometimes" reports. A single transient
+    # Groq hiccup (rate limit, timeout) used to get permanently cached as
+    # "this title's Polish page is just in English" for a full 6 hours,
+    # with no way for it to self-correct until that TTL expired. A short
+    # TTL here means the next viewer within a few minutes gets a fresh
+    # attempt instead of the same stuck fallback.
+    cache_set(cache_key, result, ttl_seconds=21600 if translation_ok else 120)
     return result
 
 
