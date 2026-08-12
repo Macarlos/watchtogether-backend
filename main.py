@@ -493,9 +493,16 @@ async def detect_region(request: Request):
             region = country_code if country_code in SUPPORTED_REGIONS else DEFAULT_REGION
             result = {"region": region, "detected_country": country_code or None}
             # Cache per IP for a while — this is a decorative feature, not
-            # something that needs to be re-checked on every single request,
-            # and it keeps us comfortably under freeipapi's free rate limit.
-            cache_set(cache_key, result, ttl_seconds=3600)
+            # something that needs to be re-checked on every single request.
+            # Kept relatively short (15 min, not the original 1 hour): free
+            # IP geolocation is occasionally wrong for mobile/CGNAT carrier
+            # IPs specifically, and a wrong result used to stick around for
+            # a full hour once cached — meaning a real visitor with a
+            # mis-geolocated IP had no way to self-correct except waiting
+            # out the cache or getting a new IP (e.g. via a phone restart).
+            # 15 minutes is still comfortably under freeipapi's free rate
+            # limit while cutting how long anyone stays stuck wrong.
+            cache_set(cache_key, result, ttl_seconds=900)
             return result
     except Exception:
         pass
