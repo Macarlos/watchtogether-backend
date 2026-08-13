@@ -1139,7 +1139,15 @@ def generate_pl_accent_variants(text, max_variants=15):
             accented = _PL_ACCENT_MAP[lower]
             positions.append((i, [ch, accented.upper() if ch.isupper() else accented]))
 
-    cap_variants = [False, True] if text[:1].islower() else [False]
+    # Always try both first-letter cases, regardless of how it was typed.
+    # Previously this only ever added capitalization (lowercase-typed query
+    # could also try an uppercase-first variant) but never removed it — an
+    # uppercase-typed query like "Tesciowie" had no path to ever try
+    # "teściowie", which is what MOTN's search actually needed to match.
+    # That's why "tesciowie" (lowercase) used to find the title while
+    # "Tesciowie" (capitalized, arguably the more natural way to type a
+    # proper noun) did not.
+    cap_variants = [False, True]
     seen, results = set(), []
     n = len(positions)
     for distance in range(0, n + 1):
@@ -1158,7 +1166,10 @@ def generate_pl_accent_variants(text, max_variants=15):
                 for cap in cap_variants:
                     candidate = "".join(new_chars)
                     if cap:
-                        candidate = candidate[:1].upper() + candidate[1:]
+                        # Flip whichever case the first letter currently is,
+                        # rather than assuming it always needs uppercasing.
+                        first = candidate[:1]
+                        candidate = (first.lower() if first.isupper() else first.upper()) + candidate[1:]
                     if candidate != text and candidate not in seen:
                         seen.add(candidate)
                         results.append(candidate)
