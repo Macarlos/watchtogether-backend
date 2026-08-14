@@ -1050,7 +1050,28 @@ async def find_trailer(
         return {"video_id": None}
 
     items = r.json().get("items", [])
-    video_id = items[0]["id"]["videoId"] if items and items[0].get("id", {}).get("videoId") else None
+    video_id = None
+    if items and items[0].get("id", {}).get("videoId"):
+        # Sanity-check the result before trusting it — YouTube's search
+        # doesn't guarantee relevance, especially for less-common titles
+        # with generic English translations (a real case: "Teściowie"
+        # (2021), shown in-app as "The In-Laws", returned an unrelated
+        # Columbo video as its top hit for "The In-Laws 2021 official
+        # trailer" — nothing in the code previously checked that the
+        # result had anything to do with the actual movie before embedding
+        # it). Require at least one significant word from the requested
+        # title to actually appear in the result's video title; if not,
+        # treat it as no match rather than confidently embedding the wrong
+        # video — the frontend already falls back gracefully to a plain
+        # "open on YouTube" link when video_id is None.
+        result_title = items[0].get("snippet", {}).get("title", "").lower()
+        stopwords = {"the", "a", "an", "of", "and", "in", "on", "official", "trailer", "movie", "film", "hd", "4k"}
+        significant_words = [
+            w for w in re.findall(r"[\w']+", title.lower())
+            if w not in stopwords and len(w) > 1
+        ]
+        if not significant_words or any(w in result_title for w in significant_words):
+            video_id = items[0]["id"]["videoId"]
 
     response = {"video_id": video_id}
     cache_set(cache_key, response, ttl_seconds=90 * 86400)
