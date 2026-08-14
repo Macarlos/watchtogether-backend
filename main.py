@@ -425,20 +425,25 @@ def build_result_from_motn_show(show):
     poster_set = show.get("imageSet", {}).get("verticalPoster", {})
     backdrop_set = show.get("imageSet", {}).get("horizontalBackdrop", {})
     title = show.get("title")
+    original_title = show.get("originalTitle")
     year = show.get("firstAirYear") if is_series else show.get("releaseYear")
 
     # MOTN's schema confirmed has no trailer field at all (unlike Watchmode).
     # Rather than show nothing, link to a YouTube search for it — same
     # "point them at a search rather than nothing" pattern already used for
-    # the JustWatch fallback link when streaming info is missing.
+    # the JustWatch fallback link when streaming info is missing. Uses the
+    # original title here too, when it differs from the display title, for
+    # the same reason /api/trailer does — see that endpoint's docstring.
     trailer_url = None
-    if title:
-        query = f"{title} {year} official trailer" if year else f"{title} official trailer"
+    search_title = original_title if original_title and original_title != title else title
+    if search_title:
+        query = f"{search_title} {year} official trailer" if year else f"{search_title} official trailer"
         trailer_url = f"https://www.youtube.com/results?search_query={quote_plus(query)}"
 
     return {
         "id": show.get("id"),
         "title": title,
+        "original_title": original_title if original_title != title else None,
         "year": year,
         "end_year": show.get("lastAirYear") if is_series else None,
         "overview": show.get("overview", ""),
@@ -1007,29 +1012,12 @@ async def recently_added(
     return {"results": shuffled, "count": len(shuffled)}
 
 
-@app.get("/api/trailer")
-async def find_trailer(
-    title: str = Query(..., description="Movie/show title"),
-    year: str = Query("", description="Release year, improves match accuracy"),
-):
-    """Finds one specific, real trailer video via YouTube's search API,
-    instead of just linking to a YouTube search results page. Called
-    on-demand — only when someone actually opens a title's details and
-    taps to watch the trailer, not eagerly for every card in a batch,
-    since YouTube's free tier only allows ~100 searches/day and most
-    swiped cards never get this far. Cached for 90 days per title+year,
-    since a movie's trailer is effectively permanent.
-    """
-    if not YOUTUBE_API_KEY:
-        return {"video_id": None}
-
-    cache_key = ("trailer", title.lower().strip(), year)
-    cached = cache_get(cache_key)
-    if cached is not None:
-        _stats["cache_hits"] += 1
-        return cached
-
-    query = f"{title} {year} official trailer" if year else f"{title} official trailer"
+async def try_youtube_trailer_search(query_title, year):
+    """One YouTube search attempt for a given title string, with the same
+    relevance sanity-check applied regardless of which title variant is
+    being tried. Returns a video_id or None — never raises; a failed
+    attempt just means the caller tries the next variant (or gives up)."""
+    query = f"{query_title} {year} official trailer" if year else f"{query_title} official trailer"
     params = {
         "key": YOUTUBE_API_KEY,
         "q": query,
@@ -1043,35 +1031,68 @@ async def find_trailer(
         async with httpx.AsyncClient(timeout=10) as client:
             r = await client.get(YOUTUBE_SEARCH_BASE, params=params)
     except httpx.HTTPError:
-        return {"video_id": None}  # trailer is a nice-to-have — never break the page over it
+        return None
 
     if r.status_code != 200:
-        # Out of quota, bad key, etc. — fail soft, same reasoning as above.
-        return {"video_id": None}
+        return None
 
     items = r.json().get("items", [])
+    if not items or not items[0].get("id", {}).get("videoId"):
+        return None
+
+    # Sanity-check the result before trusting it — YouTube's search doesn't
+    # guarantee relevance, especially for less-common titles. Require at
+    # least one significant word from the searched title to actually appear
+    # in the result's video title; if not, treat it as no match.
+    result_title = items[0].get("snippet", {}).get("title", "").lower()
+    stopwords = {"the", "a", "an", "of", "and", "in", "on", "official", "trailer", "movie", "film", "hd", "4k"}
+    significant_words = [
+        w for w in re.findall(r"[\w']+", query_title.lower())
+        if w not in stopwords and len(w) > 1
+    ]
+    if not significant_words or any(w in result_title for w in significant_words):
+        return items[0]["id"]["videoId"]
+    return None
+
+
+@app.get("/api/trailer")
+async def find_trailer(
+    title: str = Query(..., description="Movie/show title (display/translated title)"),
+    year: str = Query("", description="Release year, improves match accuracy"),
+    original_title: str = Query("", description="Native-language original title, when it differs from the display title"),
+):
+    """Finds one specific, real trailer video via YouTube's search API,
+    instead of just linking to a YouTube search results page. Called
+    on-demand — only when someone actually opens a title's details and
+    taps to watch the trailer, not eagerly for every card in a batch,
+    since YouTube's free tier only allows ~100 searches/day and most
+    swiped cards never get this far. Cached for 90 days per title+year,
+    since a movie's trailer is effectively permanent.
+
+    Tries original_title FIRST when given, before falling back to title.
+    This matters for foreign-language films: MOTN's display title is often
+    a translated/international title (e.g. "The In-Laws" for the Polish
+    film "Teściowie"), but the film's actual trailer on YouTube is almost
+    always uploaded under its native-language title — real case that
+    surfaced this: searching "The In-Laws 2021 official trailer" matched
+    an unrelated Columbo video (a generic English phrase, easy to collide
+    with unrelated content), while "Teściowie 2021 official trailer" finds
+    the real Polish-language trailer directly.
+    """
+    if not YOUTUBE_API_KEY:
+        return {"video_id": None}
+
+    cache_key = ("trailer", title.lower().strip(), year, original_title.lower().strip())
+    cached = cache_get(cache_key)
+    if cached is not None:
+        _stats["cache_hits"] += 1
+        return cached
+
     video_id = None
-    if items and items[0].get("id", {}).get("videoId"):
-        # Sanity-check the result before trusting it — YouTube's search
-        # doesn't guarantee relevance, especially for less-common titles
-        # with generic English translations (a real case: "Teściowie"
-        # (2021), shown in-app as "The In-Laws", returned an unrelated
-        # Columbo video as its top hit for "The In-Laws 2021 official
-        # trailer" — nothing in the code previously checked that the
-        # result had anything to do with the actual movie before embedding
-        # it). Require at least one significant word from the requested
-        # title to actually appear in the result's video title; if not,
-        # treat it as no match rather than confidently embedding the wrong
-        # video — the frontend already falls back gracefully to a plain
-        # "open on YouTube" link when video_id is None.
-        result_title = items[0].get("snippet", {}).get("title", "").lower()
-        stopwords = {"the", "a", "an", "of", "and", "in", "on", "official", "trailer", "movie", "film", "hd", "4k"}
-        significant_words = [
-            w for w in re.findall(r"[\w']+", title.lower())
-            if w not in stopwords and len(w) > 1
-        ]
-        if not significant_words or any(w in result_title for w in significant_words):
-            video_id = items[0]["id"]["videoId"]
+    if original_title and original_title.strip() and original_title.strip().lower() != title.strip().lower():
+        video_id = await try_youtube_trailer_search(original_title.strip(), year)
+    if video_id is None:
+        video_id = await try_youtube_trailer_search(title, year)
 
     response = {"video_id": video_id}
     cache_set(cache_key, response, ttl_seconds=90 * 86400)
