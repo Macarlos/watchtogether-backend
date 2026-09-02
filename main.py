@@ -564,14 +564,49 @@ async def detect_region(request: Request):
     return {"region": DEFAULT_REGION, "detected_country": None}
 
 
+# Some platforms MOTN's own /countries/{region} listing includes despite
+# having essentially zero real catalog there in practice — confirmed via
+# real-world research (not something MOTN's own API tells us), after a
+# tester found Peacock and The Roku Channel both showing up as selectable
+# for Poland, yet returning completely empty Top 10 results. Platforms with
+# no entry here are treated as unrestricted everywhere — this only actively
+# filters the specific ones we've explicitly researched and confirmed are
+# genuinely region-locked in reality.
+PLATFORM_REGION_ALLOWLIST = {
+    "peacock": {"US"},  # NBCUniversal's Peacock is US-only (plus a few US territories not in SUPPORTED_REGIONS)
+    "roku": {"US", "CA", "MX", "GB", "FR", "DE"},  # The Roku Channel's actual supported footprint
+}
+
+def _platform_allowed_in_region(service_id, region):
+    allowed_regions = PLATFORM_REGION_ALLOWLIST.get(service_id)
+    return allowed_regions is None or region in allowed_regions
+
+# The reverse problem: services MOTN genuinely supports (confirmed via
+# their own "Countries & Services" reference) but which don't naturally
+# surface in their own per-country "top 8 by popularity" ranking, despite
+# being genuinely mainstream in that market. Pinned here so they're
+# included regardless of raw ranking position — pulls the REAL entry
+# (logo included) from MOTN's own full response if present, rather than
+# guessing at any of its fields ourselves; if it's genuinely not in MOTN's
+# data for that region, this safely does nothing.
+PINNED_PLATFORMS_BY_REGION = {
+    "PL": {"skyshowtime"},  # genuinely major in Poland (launched Feb 2024, positioned alongside Netflix/Disney+/HBO Max in real market comparisons); confirmed present in MOTN's own data for every other Central/Eastern European + Nordic market checked (Bulgaria, Croatia, Czech Republic, Denmark, Finland all have it) — extremely likely present for Poland too, just outside the raw top-8 cutoff
+    "BR": {"plutotv"},  # confirmed in MOTN's full Brazil service list, just outside the top-8 cutoff
+    "FR": {"plutotv"},  # confirmed in MOTN's full France service list, just outside the top-8 cutoff
+}
+
 @app.get("/api/platforms")
 async def get_platforms(region: str = "US"):
     """Real per-country platform list. Different countries have genuinely
     different top streaming services — confirmed via live checks against
     MOTN's /countries endpoint before building this (e.g. Hulu is US-only;
     the UK has iPlayer/ITVX; Australia has Stan; Spain/Poland have
-    SkyShowtime instead of Paramount+). Netflix/Prime/Disney+/HBO/Apple TV
-    are universal across every region checked so far."""
+    SkyShowtime instead of Paramount+ — see PINNED_PLATFORMS_BY_REGION,
+    since MOTN's own top-8 cutoff doesn't reliably surface it despite this).
+    Netflix/Prime/Disney+/HBO/Apple TV are universal across every region
+    checked so far. Also see PLATFORM_REGION_ALLOWLIST — a couple of
+    platforms MOTN lists per-country don't actually have real regional
+    catalogs to match."""
     region = region.upper() if region.upper() in SUPPORTED_REGIONS else DEFAULT_REGION
 
     if not MOTN_API_KEY:
@@ -598,7 +633,17 @@ async def get_platforms(region: str = "US"):
         record_motn_call()
 
     data = r.json()
-    services = data.get("services", [])[:8]  # top 8 by popularity, per MOTN's own ordering
+    all_services = [s for s in data.get("services", []) if _platform_allowed_in_region(s.get("id"), region)]
+    services = all_services[:8]  # top 8 by popularity, per MOTN's own ordering
+
+    pinned_ids = PINNED_PLATFORMS_BY_REGION.get(region, set())
+    if pinned_ids:
+        already_included = {s.get("id") for s in services}
+        for s in all_services:
+            if s.get("id") in pinned_ids and s.get("id") not in already_included:
+                services.append(s)
+                already_included.add(s.get("id"))
+
     platforms = []
     for s in services:
         images = s.get("imageSet", {})
