@@ -483,7 +483,10 @@ def build_result_from_motn_show(show):
 
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "Watch2Night API"}
+    # A simple way to verify a Render deploy actually went through — visit
+    # this URL directly and check the version matches what was just pushed.
+    # Same purpose as index.html's footer version tag, just for the backend.
+    return {"status": "ok", "service": "Watch2Night API", "version": "b1.2"}
 
 
 @app.post("/api/ping")
@@ -593,6 +596,11 @@ PINNED_PLATFORMS_BY_REGION = {
     "PL": {"skyshowtime"},  # genuinely major in Poland (launched Feb 2024, positioned alongside Netflix/Disney+/HBO Max in real market comparisons); confirmed present in MOTN's own data for every other Central/Eastern European + Nordic market checked (Bulgaria, Croatia, Czech Republic, Denmark, Finland all have it) — extremely likely present for Poland too, just outside the raw top-8 cutoff
     "BR": {"plutotv"},  # confirmed in MOTN's full Brazil service list, just outside the top-8 cutoff
     "FR": {"plutotv"},  # confirmed in MOTN's full France service list, just outside the top-8 cutoff
+    "DE": {"rtl"},  # RTL+ is confirmed present in MOTN's data for Austria, and Germany is RTL's actual home/primary market (headquartered there) — strong indirect confidence even without directly confirming Germany's own MOTN entry
+    # Mexico (Vix) and Spain (Movistar+) were investigated but never
+    # confirmed either way against MOTN's own data — not pinned, since
+    # guessing without evidence risks the same wrong-field problem this
+    # whole pinning mechanism was built to avoid in the first place.
 }
 
 @app.get("/api/platforms")
