@@ -486,7 +486,7 @@ def root():
     # A simple way to verify a Render deploy actually went through — visit
     # this URL directly and check the version matches what was just pushed.
     # Same purpose as index.html's footer version tag, just for the backend.
-    return {"status": "ok", "service": "Watch2Night API", "version": "b1.2"}
+    return {"status": "ok", "service": "Watch2Night API", "version": "b1.3"}
 
 
 @app.post("/api/ping")
@@ -647,9 +647,11 @@ async def get_platforms(region: str = "US"):
     pinned_ids = PINNED_PLATFORMS_BY_REGION.get(region, set())
     if pinned_ids:
         already_included = {s.get("id") for s in services}
+        insert_at = min(3, len(services))  # right after the first few universal names (Netflix/Prime/Disney...), not buried last — being pinned at all already means we've judged it more locally significant than MOTN's raw popularity ranking reflects, so displaying it last would undercut the entire point of pinning it
         for s in all_services:
             if s.get("id") in pinned_ids and s.get("id") not in already_included:
-                services.append(s)
+                services.insert(insert_at, s)
+                insert_at += 1
                 already_included.add(s.get("id"))
 
     platforms = []
