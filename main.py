@@ -278,10 +278,13 @@ _stats = {
     "total_motn_api_calls": 0,  # real HTTP calls to Movie of the Night — 1 call = 1 request, no per-title enrichment cost
     "total_search_calls": 0,
     "total_provider_checks": 0,
+    "total_trailer_calls": 0,
+    "total_top10_calls": 0,  # subset of discover calls specifically using Top 10's popularity_1year sort
     "cache_hits": 0,  # requests served without spending any Watchmode credits
     "platform_counts": defaultdict(int),
     "genre_counts": defaultdict(int),
     "content_type_counts": defaultdict(int),
+    "region_counts": defaultdict(int),
 }
 
 # ── MOTN usage tracking (persistent) ──
@@ -333,11 +336,13 @@ def _load_usage():
     if data.get("day") != today:
         data["day"] = today
         data["day_count"] = 0
+        data["visits_day_count"] = 0  # reset alongside the MOTN day counter — same "today" boundary
     if data.get("period") != period_label:
         data["period"] = period_label
         data["period_count"] = 0
     data.setdefault("day_count", 0)
     data.setdefault("period_count", 0)
+    data.setdefault("visits_day_count", 0)
     return data
 
 def record_motn_call():
@@ -353,6 +358,21 @@ def record_motn_call():
     except OSError:
         pass  # tracking is best-effort — never let it break a real request
 
+def record_visit():
+    """Call this once per page load (see /api/ping). Persisted to disk with
+    the same day-boundary logic as MOTN call tracking, unlike _stats's
+    total_page_loads — that one is in-memory only and resets on every
+    redeploy, which made it useless for a genuine "visits today" figure
+    whenever the backend hadn't redeployed recently (it'd show however many
+    days had accumulated since the last deploy, not actually today)."""
+    data = _load_usage()
+    data["visits_day_count"] += 1
+    try:
+        with open(USAGE_FILE, "w") as f:
+            json.dump(data, f)
+    except OSError:
+        pass
+
 def usage_info():
     data = _load_usage()
     today_date = datetime.date.today()
@@ -365,6 +385,7 @@ def usage_info():
     return {
         "today": data["day"],
         "calls_today": data["day_count"],
+        "visits_today": data["visits_day_count"],
         "billing_period_started": period_start.isoformat(),
         "billing_period_ends": period_end.isoformat(),
         "calls_this_period": data["period_count"],
@@ -469,8 +490,13 @@ def root():
 def ping():
     """Anonymous session counter — increments once per page load. No cookie,
     no identifier, nothing that could distinguish one visitor from another;
-    just a running tally of how many times the app has been opened."""
+    just a running tally of how many times the app has been opened.
+    Persisted via record_visit() (see usage_info()'s "visits_today") in
+    addition to the in-memory _stats counter — the in-memory one resets on
+    every redeploy, which made "today" numbers unreliable whenever the
+    backend hadn't redeployed recently."""
     _stats["total_page_loads"] += 1
+    record_visit()
     return {"ok": True}
 
 
@@ -737,6 +763,7 @@ async def discover(
     order_by: str = Query("popularity_1year", description="Sort order — the frontend randomizes this once per session for variety, since MOTN can't jump to a random page"),
     language: str = Query("en", description="UI language — only en/es/fr/de get passed to MOTN as output_language; pt/hi/pl aren't supported by MOTN so this stays English for the swipe deck (overview translation happens only on the detail view)"),
     min_rating: int = Query(0, ge=0, le=10, description="Optional minimum rating on our 0-10 display scale (0 = no filter). Multiplied by 10 before being sent to MOTN, since MOTN's own rating_min filter is on a 0-100 scale."),
+    mode: str = Query("", description="Purely for stats tracking — the frontend sends 'top10' for Top 10 requests specifically. Not used for any actual query logic; order_by already does that job. Exists because order_by=popularity_1year alone can't reliably distinguish a real Top 10 request from regular browsing that happened to randomly land on the same sort order."),
 ):
     if not MOTN_API_KEY:
         raise HTTPException(status_code=500, detail="MOTN_API_KEY is not configured on the server.")
@@ -749,6 +776,9 @@ async def discover(
 
     _stats["total_discover_calls"] += 1
     _stats["content_type_counts"][content_type] += 1
+    _stats["region_counts"][region] += 1
+    if mode == "top10":
+        _stats["total_top10_calls"] += 1
     for p in platforms.split(","):
         if p:
             _stats["platform_counts"][p] += 1
@@ -884,6 +914,7 @@ async def recently_added(
     motn_language = language if language in MOTN_NATIVE_LANGUAGES else "en"
     region = region.upper() if region.upper() in SUPPORTED_REGIONS else DEFAULT_REGION
     motn_content_type = "series" if content_type == "tv_series" else "movie"
+    _stats["region_counts"][region] += 1
 
     catalogs = [p for p in platforms.split(",") if p and re.fullmatch(r"[a-z0-9_]+", p)]
 
@@ -1082,6 +1113,7 @@ async def find_trailer(
     if not YOUTUBE_API_KEY:
         return {"video_id": None}
 
+    _stats["total_trailer_calls"] += 1
     cache_key = ("trailer", title.lower().strip(), year, original_title.lower().strip())
     cached = cache_get(cache_key)
     if cached is not None:
