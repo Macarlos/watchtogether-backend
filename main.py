@@ -486,7 +486,7 @@ def root():
     # A simple way to verify a Render deploy actually went through — visit
     # this URL directly and check the version matches what was just pushed.
     # Same purpose as index.html's footer version tag, just for the backend.
-    return {"status": "ok", "service": "Watch2Night API", "version": "b1.3"}
+    return {"status": "ok", "service": "Watch2Night API", "version": "b1.4"}
 
 
 @app.post("/api/ping")
@@ -597,10 +597,21 @@ PINNED_PLATFORMS_BY_REGION = {
     "BR": {"plutotv"},  # confirmed in MOTN's full Brazil service list, just outside the top-8 cutoff
     "FR": {"plutotv"},  # confirmed in MOTN's full France service list, just outside the top-8 cutoff
     "DE": {"rtl"},  # RTL+ is confirmed present in MOTN's data for Austria, and Germany is RTL's actual home/primary market (headquartered there) — strong indirect confidence even without directly confirming Germany's own MOTN entry
-    # Mexico (Vix) and Spain (Movistar+) were investigated but never
-    # confirmed either way against MOTN's own data — not pinned, since
-    # guessing without evidence risks the same wrong-field problem this
-    # whole pinning mechanism was built to avoid in the first place.
+    "GB": {"all4"},  # Channel 4 — directly confirmed as a real MOTN service (id: all4), one of the UK's core terrestrial broadcasters, missing from the current top-8 despite being arguably more mainstream than Paramount+ to a general UK audience
+    # Full deep-dive audit done Sept 3, 2026, across every supported region
+    # (not just the ones a tester happened to flag first) — for fairness,
+    # since the earlier round only covered regions someone had already
+    # raised a concern about:
+    #   - US: no gap found, already a solid top-8
+    #   - CA (Crave, BritBox), AU (Stan), IN (JioHotstar/Zee5/SonyLiv):
+    #     already genuinely well-localized in their current top-8, no
+    #     changes needed
+    #   - AU: checked Foxtel/Binge specifically — real services, but never
+    #     confirmed against MOTN's own data one way or the other; not
+    #     pinned, since guessing risks the same wrong-field problem this
+    #     whole mechanism exists to avoid
+    #   - MX (Vix) and ES (Movistar+): investigated earlier, still
+    #     unconfirmed
 }
 
 @app.get("/api/platforms")
