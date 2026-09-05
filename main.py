@@ -430,6 +430,31 @@ def wallpaper_cache_status():
         "entries": entries,
     }
 
+def _motn_image_or_none(url):
+    """MOTN doesn't leave image fields empty when it has no real artwork for
+    a title — it auto-generates a placeholder SVG with the title text
+    stamped on a plain background, at every requested size, and returns
+    that URL like it was a real poster/backdrop (confirmed by comparing
+    /changes and /shows/{id} directly for "BLACK TRICK: The Lawyer Who
+    Controls Justice", Sept 2026 — both returned the identical
+    movieofthenight.com/media/image.svg?title=... URL, so this isn't a lag
+    between endpoints, it's MOTN's genuine "no artwork" signal).
+
+    Without this check, that placeholder URL looks exactly like a real
+    poster to our code (poster_set.get("w480") is truthy either way), so it
+    was passed straight to the frontend, which rendered it as a mostly-black
+    card with faint title text — indistinguishable from a real bug to a
+    user, but actually MOTN honestly telling us it has nothing.
+
+    Returns None for a detected placeholder so downstream code treats it
+    exactly the same as a genuinely missing image (existing frontend
+    fallback already handles poster_url/backdrop_url being falsy).
+    """
+    if url and "movieofthenight.com/media/image.svg" in url:
+        return None
+    return url
+
+
 def build_result_from_motn_show(show):
     """Maps a raw Movie of the Night 'show' object into the exact same shape
     build_result_from_details produces, so the frontend needs zero changes
@@ -469,8 +494,8 @@ def build_result_from_motn_show(show):
         "end_year": show.get("lastAirYear") if is_series else None,
         "overview": show.get("overview", ""),
         "will_you_like_this": "",  # no MOTN equivalent
-        "poster_url": poster_set.get("w480") or poster_set.get("w360"),
-        "backdrop_url": backdrop_set.get("w720") or backdrop_set.get("w480"),
+        "poster_url": _motn_image_or_none(poster_set.get("w480") or poster_set.get("w360")),
+        "backdrop_url": _motn_image_or_none(backdrop_set.get("w720") or backdrop_set.get("w480")),
         "genres": [g.get("name") for g in show.get("genres", []) if g.get("name")],
         "runtime_minutes": None if is_series else show.get("runtime"),
         "rating": round(show["rating"] / 10, 1) if show.get("rating") is not None else None,
@@ -486,7 +511,7 @@ def root():
     # A simple way to verify a Render deploy actually went through — visit
     # this URL directly and check the version matches what was just pushed.
     # Same purpose as index.html's footer version tag, just for the backend.
-    return {"status": "ok", "service": "Watch2Night API", "version": "b1.4"}
+    return {"status": "ok", "service": "Watch2Night API", "version": "b1.5"}
 
 
 @app.post("/api/ping")
