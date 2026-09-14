@@ -511,7 +511,7 @@ def root():
     # A simple way to verify a Render deploy actually went through — visit
     # this URL directly and check the version matches what was just pushed.
     # Same purpose as index.html's footer version tag, just for the backend.
-    return {"status": "ok", "service": "Watch2Night API", "version": "b1.7"}
+    return {"status": "ok", "service": "Watch2Night API", "version": "b1.8"}
 
 
 @app.post("/api/ping")
@@ -567,7 +567,7 @@ async def detect_region(request: Request):
         return cached
 
     try:
-        async with httpx.AsyncClient(timeout=3) as client:
+        async with httpx.AsyncClient(timeout=3, follow_redirects=True) as client:
             r = await client.get(f"https://free.freeipapi.com/api/json/{client_ip}")
         if r.status_code == 200:
             data = r.json()
