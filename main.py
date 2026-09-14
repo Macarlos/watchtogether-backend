@@ -511,7 +511,7 @@ def root():
     # A simple way to verify a Render deploy actually went through — visit
     # this URL directly and check the version matches what was just pushed.
     # Same purpose as index.html's footer version tag, just for the backend.
-    return {"status": "ok", "service": "Watch2Night API", "version": "b1.5"}
+    return {"status": "ok", "service": "Watch2Night API", "version": "b1.7"}
 
 
 @app.post("/api/ping")
@@ -586,8 +586,23 @@ async def detect_region(request: Request):
             # limit while cutting how long anyone stays stuck wrong.
             cache_set(cache_key, result, ttl_seconds=900)
             return result
-    except Exception:
-        pass
+        else:
+            # Previously silent — a non-200 here (e.g. 429 rate-limited, 403
+            # blocked) fell straight through to the US/English default with
+            # no trace of why. Logging it so a systemic failure (like every
+            # visitor landing on English right now) is actually diagnosable
+            # from Render's logs instead of invisible.
+            logger.warning(
+                "detect-region: freeipapi non-200 for ip=%s — status=%s body=%s",
+                client_ip, r.status_code, r.text[:200],
+            )
+    except Exception as e:
+        # Also previously silent (bare `except Exception: pass`) — same
+        # reasoning, this is the other blind spot.
+        logger.warning(
+            "detect-region: freeipapi request failed for ip=%s — %s: %s",
+            client_ip, type(e).__name__, e,
+        )
 
     return {"region": DEFAULT_REGION, "detected_country": None}
 
