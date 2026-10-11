@@ -20,6 +20,7 @@ import random
 import time
 import itertools
 import logging
+import threading
 from urllib.parse import quote_plus
 from collections import defaultdict
 import httpx
@@ -373,6 +374,66 @@ def record_visit():
     except OSError:
         pass
 
+# ── Opens by platform (app vs. web), kept per day ──
+# record_visit() above only keeps a single "today" number with no history and
+# no way to tell the Android app from the website. This keeps a small per-day
+# tally split by platform so "did anyone actually open the app?" has a real
+# answer. Counts only — no cookie, no identifier, nothing per-visitor.
+# Same persistence caveat as USAGE_FILE: lives on the instance disk, so a
+# fresh deploy from a new image can reset it.
+OPENS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "opens_by_day.json")
+OPENS_PLATFORMS = ("app", "web", "unknown")
+OPENS_KEEP_DAYS = 60
+_opens_lock = threading.Lock()
+
+def _load_opens():
+    try:
+        with open(OPENS_FILE, "r") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+def record_open(platform):
+    """Add one open for today under the given platform ("app", "web", or
+    anything else, which is counted as "unknown"). Best-effort — never lets a
+    tracking failure break the request."""
+    if platform not in OPENS_PLATFORMS:
+        platform = "unknown"
+    today = datetime.date.today().isoformat()
+    try:
+        with _opens_lock:
+            data = _load_opens()
+            day = data.setdefault(today, {})
+            day[platform] = int(day.get(platform, 0)) + 1
+            for old in sorted(data.keys())[:-OPENS_KEEP_DAYS]:
+                data.pop(old, None)  # keep only the most recent OPENS_KEEP_DAYS days
+            tmp = OPENS_FILE + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(data, f)
+            os.replace(tmp, OPENS_FILE)  # atomic swap so a crash can't leave a half-written file
+    except (OSError, ValueError, TypeError):
+        pass
+
+def opens_report(days=14):
+    """Last `days` days of opens, newest first, each with per-platform counts
+    and a total, plus an overall total across the window."""
+    data = _load_opens()
+    rows = []
+    totals = {p: 0 for p in OPENS_PLATFORMS}
+    for date_key in sorted(data.keys(), reverse=True)[:days]:
+        day = data.get(date_key) or {}
+        row = {"date": date_key}
+        total = 0
+        for p in OPENS_PLATFORMS:
+            n = int(day.get(p, 0))
+            row[p] = n
+            totals[p] += n
+            total += n
+        row["total"] = total
+        rows.append(row)
+    return {"days": rows, "totals_in_window": {**totals, "total": sum(totals.values())}}
+
 def usage_info():
     data = _load_usage()
     today_date = datetime.date.today()
@@ -511,11 +572,11 @@ def root():
     # A simple way to verify a Render deploy actually went through — visit
     # this URL directly and check the version matches what was just pushed.
     # Same purpose as index.html's footer version tag, just for the backend.
-    return {"status": "ok", "service": "Watch2Night API", "version": "b1.8"}
+    return {"status": "ok", "service": "Watch2Night API", "version": "b1.9"}
 
 
 @app.post("/api/ping")
-def ping():
+async def ping(request: Request):
     """Anonymous session counter — increments once per page load. No cookie,
     no identifier, nothing that could distinguish one visitor from another;
     just a running tally of how many times the app has been opened.
@@ -525,6 +586,19 @@ def ping():
     backend hadn't redeployed recently."""
     _stats["total_page_loads"] += 1
     record_visit()
+    # Optional body {"platform": "app" | "web"} — sent by the frontend so opens
+    # can be split by platform. An older cached frontend sends no body at all,
+    # which is simply counted as "unknown".
+    platform = "unknown"
+    try:
+        raw = await request.body()
+        if raw:
+            payload = json.loads(raw)
+            if isinstance(payload, dict) and isinstance(payload.get("platform"), str):
+                platform = payload["platform"][:16]
+    except (ValueError, UnicodeDecodeError):
+        pass
+    record_open(platform)
     return {"ok": True}
 
 
@@ -736,7 +810,7 @@ def admin_usage(key: str = Query("", description="Must match the ADMIN_KEY envir
     """
     if not ADMIN_KEY or key != ADMIN_KEY:
         raise HTTPException(status_code=403, detail="Invalid or missing key.")
-    return {**usage_info(), "wallpaper_cache": wallpaper_cache_status()}
+    return {**usage_info(), "opens_by_platform": opens_report(14), "wallpaper_cache": wallpaper_cache_status()}
 
 
 @app.get("/api/admin/all-platforms")
