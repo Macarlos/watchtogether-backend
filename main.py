@@ -572,7 +572,7 @@ def root():
     # A simple way to verify a Render deploy actually went through — visit
     # this URL directly and check the version matches what was just pushed.
     # Same purpose as index.html's footer version tag, just for the backend.
-    return {"status": "ok", "service": "Watch2Night API", "version": "b1.9"}
+    return {"status": "ok", "service": "Watch2Night API", "version": "b1.10"}
 
 
 @app.post("/api/ping")
@@ -603,9 +603,13 @@ async def ping(request: Request):
 
 
 # ── Supported regions & country auto-detection ──
-# Watchmode's free tier allows choosing up to 3 countries; these are the
-# ones configured on the account. Anything else falls back to US.
-SUPPORTED_REGIONS = {"US", "CA", "IN", "GB", "AU", "MX", "ES", "BR", "FR", "DE", "PL"}
+# Countries covered by the Movie of the Night plan (platform lists and
+# availability are fetched per country from MOTN). Anything else falls back to US.
+SUPPORTED_REGIONS = {
+    "US", "CA", "IN", "GB", "AU", "MX", "ES", "BR", "FR", "DE", "PL",
+    # Added b1.10: all covered by the Movie of the Night plan
+    "IE", "NZ", "PT", "AR", "CO", "AT", "CH", "SG", "AE",
+}
 DEFAULT_REGION = "US"
 
 # For the later UI-translation stage — which of the 7 supported languages
@@ -618,6 +622,10 @@ REGION_TO_LANGUAGE = {
     "FR": "fr",
     "DE": "de",
     "PL": "pl",
+    "IE": "en", "NZ": "en", "SG": "en", "AE": "en",
+    "PT": "pt",
+    "AR": "es", "CO": "es",
+    "AT": "de", "CH": "de",
 }
 
 @app.get("/api/detect-region")
