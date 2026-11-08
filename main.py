@@ -434,6 +434,162 @@ def opens_report(days=14):
         rows.append(row)
     return {"days": rows, "totals_in_window": {**totals, "total": sum(totals.values())}}
 
+# ── Anonymous device tracking (added b1.11) ──
+# Answers "do people come back?" and "which countries stay?". The frontend
+# keeps a random ID in its own storage and sends it with the ping; here it is
+# stored ONLY as a salted hash (never the raw ID, never an IP address) with
+# the day it was first seen, a country code and the days it was opened.
+# Held in memory and flushed to disk at most every 30 s, since the file grows
+# with every new device. Same persistence caveat as the other JSON files: on
+# Render's regular disk a fresh deploy wipes it. Set DEVICES_FILE to a path on
+# a persistent disk to keep history across deploys.
+DEVICES_FILE = os.environ.get("DEVICES_FILE") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "devices.json")
+DEVICE_SALT = os.environ.get("DEVICE_SALT") or ADMIN_KEY or "w2n-device-salt"
+DEVICES_KEEP_DAYS = 60       # per-device day history kept
+DEVICES_FLUSH_SECONDS = 30
+_devices_lock = threading.Lock()
+_devices = None              # {hash: {"f": first_day, "c": country|None, "p": platform, "d": [days]}}
+_devices_dirty = False
+_devices_last_flush = 0.0
+
+def _devices_load_locked():
+    global _devices
+    if _devices is None:
+        try:
+            with open(DEVICES_FILE, "r") as f:
+                data = json.load(f)
+            _devices = data if isinstance(data, dict) else {}
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            _devices = {}
+    return _devices
+
+def _devices_flush_locked(force=False):
+    global _devices_dirty, _devices_last_flush
+    if not _devices_dirty:
+        return
+    now = time.time()
+    if not force and now - _devices_last_flush < DEVICES_FLUSH_SECONDS:
+        return
+    try:
+        tmp = DEVICES_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(_devices, f, separators=(",", ":"))
+        os.replace(tmp, DEVICES_FILE)
+        _devices_dirty = False
+        _devices_last_flush = now
+    except (OSError, ValueError, TypeError):
+        pass
+
+def _hash_device(raw_id):
+    import hashlib
+    return hashlib.sha256((DEVICE_SALT + raw_id).encode("utf-8")).hexdigest()[:16]
+
+def device_needs_country(raw_id):
+    """True if this device is new, or was stored without a country — the only
+    cases where the ping handler spends an IP lookup."""
+    h = _hash_device(raw_id)
+    with _devices_lock:
+        rec = _devices_load_locked().get(h)
+        return rec is None or not rec.get("c")
+
+def record_device(raw_id, platform, country):
+    """Register today's open for this device. Best-effort, never raises."""
+    global _devices_dirty
+    try:
+        h = _hash_device(raw_id)
+        today = datetime.date.today().isoformat()
+        with _devices_lock:
+            devices = _devices_load_locked()
+            rec = devices.get(h)
+            if rec is None:
+                rec = {"f": today, "c": country, "p": platform if platform in OPENS_PLATFORMS else "unknown", "d": []}
+                devices[h] = rec
+            elif country and not rec.get("c"):
+                rec["c"] = country
+            if today not in rec["d"]:
+                rec["d"].append(today)
+                rec["d"] = rec["d"][-DEVICES_KEEP_DAYS:]
+            _devices_dirty = True
+            _devices_flush_locked()
+    except Exception:
+        pass
+
+def devices_report(days=14):
+    """Unique devices per day, new vs returning, today's split by country,
+    day-1 / day-7 retention per first-seen day, and day-1 retention by
+    country. A day-N figure only counts a day once it is fully over."""
+    today = datetime.date.today()
+    with _devices_lock:
+        devices = dict(_devices_load_locked())
+    parse = datetime.date.fromisoformat
+
+    def ds(offset_from_today):
+        return (today - datetime.timedelta(days=offset_from_today)).isoformat()
+
+    daily = []
+    for i in range(days):
+        day = ds(i)
+        active = new = 0
+        for rec in devices.values():
+            if day in rec.get("d", []):
+                active += 1
+                if rec.get("f") == day:
+                    new += 1
+        daily.append({"date": day, "unique_devices": active, "new": new, "returning": active - new})
+
+    today_iso = today.isoformat()
+    today_by_country = {}
+    for rec in devices.values():
+        if today_iso in rec.get("d", []):
+            c = rec.get("c") or "unknown"
+            today_by_country[c] = today_by_country.get(c, 0) + 1
+    today_by_country = dict(sorted(today_by_country.items(), key=lambda kv: -kv[1]))
+
+    def came_back(rec, n):
+        try:
+            target = (parse(rec["f"]) + datetime.timedelta(days=n)).isoformat()
+        except (KeyError, ValueError):
+            return False
+        return target in rec.get("d", [])
+
+    cohorts = []
+    for i in range(days):
+        first_day = ds(i)
+        members = [r for r in devices.values() if r.get("f") == first_day]
+        if not members:
+            continue
+        row = {"first_seen": first_day, "devices": len(members), "day1": None, "day7": None}
+        if i >= 2:   # day 1 is over only once the cohort is 2+ days old
+            n1 = sum(1 for r in members if came_back(r, 1))
+            row["day1"] = {"back": n1, "pct": round(100 * n1 / len(members))}
+        if i >= 8:
+            n7 = sum(1 for r in members if came_back(r, 7))
+            row["day7"] = {"back": n7, "pct": round(100 * n7 / len(members))}
+        cohorts.append(row)
+
+    by_country = {}
+    cutoff = ds(2)
+    for rec in devices.values():
+        if rec.get("f") and rec["f"] <= cutoff:
+            c = rec.get("c") or "unknown"
+            slot = by_country.setdefault(c, {"devices": 0, "back_day1": 0})
+            slot["devices"] += 1
+            if came_back(rec, 1):
+                slot["back_day1"] += 1
+    for slot in by_country.values():
+        slot["pct"] = round(100 * slot["back_day1"] / slot["devices"]) if slot["devices"] else 0
+    by_country = dict(sorted(by_country.items(), key=lambda kv: -kv[1]["devices"]))
+
+    return {
+        "total_devices_known": len(devices),
+        "active_today": next((d["unique_devices"] for d in daily if d["date"] == today_iso), 0),
+        "today_by_country": today_by_country,
+        "daily": daily,
+        "cohorts_day1_day7": cohorts,
+        "day1_return_by_country": by_country,
+        "note": "Devices are anonymous hashed IDs. Opens made before b1.11 are not included. A cohort's day-1 figure appears 2 days after it starts, day-7 after 8 days.",
+    }
+
 def usage_info():
     data = _load_usage()
     today_date = datetime.date.today()
@@ -572,14 +728,16 @@ def root():
     # A simple way to verify a Render deploy actually went through — visit
     # this URL directly and check the version matches what was just pushed.
     # Same purpose as index.html's footer version tag, just for the backend.
-    return {"status": "ok", "service": "Watch2Night API", "version": "b1.10"}
+    return {"status": "ok", "service": "Watch2Night API", "version": "b1.11"}
 
 
 @app.post("/api/ping")
 async def ping(request: Request):
-    """Anonymous session counter — increments once per page load. No cookie,
-    no identifier, nothing that could distinguish one visitor from another;
-    just a running tally of how many times the app has been opened.
+    """Anonymous session counter — increments once per page load. Since b1.11
+    the frontend may also send a random device ID, kept only as a salted hash
+    for unique-device and return-rate stats (see devices_report); no IP
+    address or other personal data is stored. Older frontends send none and
+    are simply counted as opens.
     Persisted via record_visit() (see usage_info()'s "visits_today") in
     addition to the in-memory _stats counter — the in-memory one resets on
     every redeploy, which made "today" numbers unreliable whenever the
@@ -590,16 +748,65 @@ async def ping(request: Request):
     # can be split by platform. An older cached frontend sends no body at all,
     # which is simply counted as "unknown".
     platform = "unknown"
+    device_id = None
     try:
         raw = await request.body()
         if raw:
             payload = json.loads(raw)
             if isinstance(payload, dict) and isinstance(payload.get("platform"), str):
                 platform = payload["platform"][:16]
+            if isinstance(payload, dict) and isinstance(payload.get("did"), str):
+                candidate = payload["did"].strip()
+                # Random ID made by the frontend: 16-64 letters/digits/dashes, nothing else
+                if 16 <= len(candidate) <= 64 and re.fullmatch(r"[A-Za-z0-9\-]+", candidate):
+                    device_id = candidate
     except (ValueError, UnicodeDecodeError):
         pass
     record_open(platform)
+    if device_id:
+        try:
+            country = None
+            if device_needs_country(device_id):
+                country = await _ping_country(request)
+            record_device(device_id, platform, country)
+        except Exception:
+            pass
     return {"ok": True}
+
+
+async def _ping_country(request: Request):
+    """Two-letter country of the caller, for the device stats only. Reuses the
+    per-IP geo cache that /api/detect-region fills, and otherwise makes the
+    same freeipapi lookup and stores the result in that same cache. Only
+    called for a device's first ping (or one that has no country yet). The IP
+    itself is never stored. Returns None on any failure."""
+    forwarded = request.headers.get("x-forwarded-for", "")
+    client_ip = forwarded.split(",")[0].strip() if forwarded else (
+        request.client.host if request.client else None
+    )
+    if not client_ip or client_ip in ("unknown", "127.0.0.1", "localhost"):
+        return None
+    cache_key = ("geo", client_ip)
+    cached = cache_get(cache_key)
+    if cached is not None:
+        return cached.get("detected_country")
+    try:
+        async with httpx.AsyncClient(timeout=3, follow_redirects=True) as client:
+            r = await client.get(f"https://free.freeipapi.com/api/json/{client_ip}")
+        if r.status_code == 200:
+            code = (r.json().get("countryCode") or "").upper()
+            region = code if code in SUPPORTED_REGIONS else DEFAULT_REGION
+            cache_set(cache_key, {"region": region, "detected_country": code or None}, ttl_seconds=900)
+            return code or None
+    except Exception:
+        pass
+    return None
+
+
+@app.on_event("shutdown")
+def _flush_devices_on_shutdown():
+    with _devices_lock:
+        _devices_flush_locked(force=True)
 
 
 # ── Supported regions & country auto-detection ──
@@ -818,7 +1025,7 @@ def admin_usage(key: str = Query("", description="Must match the ADMIN_KEY envir
     """
     if not ADMIN_KEY or key != ADMIN_KEY:
         raise HTTPException(status_code=403, detail="Invalid or missing key.")
-    return {**usage_info(), "opens_by_platform": opens_report(14), "wallpaper_cache": wallpaper_cache_status()}
+    return {**usage_info(), "opens_by_platform": opens_report(14), "devices": devices_report(14), "wallpaper_cache": wallpaper_cache_status()}
 
 
 @app.get("/api/admin/all-platforms")
